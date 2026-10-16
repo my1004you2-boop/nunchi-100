@@ -25,7 +25,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "눈치백단타이머"
 APP_NAME_EN = "Nunchi 100"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.3.0"
 
 BASE_DIR = Path(__file__).resolve().parent
 STORE_PATH = BASE_DIR / "alarms.json"
@@ -77,6 +77,18 @@ GAME_CHECK_SEC = 5
 
 WEEKDAYS = "월화수목금토일"
 
+# 미니 위젯에 보여 줄 수 있는 항목 (이 순서대로 왼쪽부터 놓인다): 키 → (설정 탭 이름, 기본으로 켤지)
+WIDGET_ITEMS = {
+    "main": ("메인 알람", True),
+    "next": ("다음 알람", True),
+    "counts": ("오늘 작업/휴식 횟수", False),
+    "events": ("오늘 일정", False),
+    "usage": ("오늘 PC 사용 시간", False),
+    "date": ("날짜·요일·음력", False),
+    "clock": ("현재 시각", False),
+}
+DEFAULT_WIDGET_ITEMS = {key: default for key, (_, default) in WIDGET_ITEMS.items()}
+
 # 캘린더 일정 알림: 기본으로 몇 분 전부터 알릴지, 고를 수 있는 시작 전 시간과 간격(분)
 EVENT_LEAD_MIN = 120
 LEADS = {"10분": 10, "30분": 30, "1시간": 60, "2시간": 120, "3시간": 180, "6시간": 360, "12시간": 720, "1일": 1440, "2일": 2880}
@@ -95,9 +107,9 @@ REPEAT_LABELS = {"once": "한 번만", "daily": "매일", "weekdays": "평일", 
 
 # 트레이 아이콘 색
 COLORS = {
-    "work": (46, 160, 67),
-    "break": (56, 120, 220),
-    "game": (150, 80, 200),
+    "work": (139, 108, 255),
+    "break": (77, 171, 247),
+    "game": (214, 92, 200),
     "off": (90, 110, 120),
     "paused": (140, 140, 140),
 }
@@ -164,6 +176,13 @@ def load_store():
         "events": data.get("events", []),
         "briefing": data.get("briefing", True),  # PC를 켤 때 오늘 일정 브리핑
         "briefed_on": data.get("briefed_on"),  # 마지막으로 브리핑한 날짜
+        # 작업 표시줄 위 미니 위젯: 켜짐 여부, 사용자가 옮긴 위치 [x, y] (없으면 오른쪽 아래), 보여 줄 항목
+        "widget": {
+            "enabled": True,
+            "pos": None,
+            **data.get("widget", {}),
+            "items": {**DEFAULT_WIDGET_ITEMS, **data.get("widget", {}).get("items", {})},
+        },
     }
 
 
@@ -796,6 +815,23 @@ def load_font(filename, size):
         return ImageFont.load_default(size)
 
 
+def tray_icon_image(minutes, fraction, color, dim=False):
+    """트레이 아이콘: 남은 분 숫자 + 줄어드는 테두리 링. 작게 보여서 크게 그린 뒤 줄인다."""
+    s = 256
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse((4, 4, s - 4, s - 4), fill=(18, 20, 28, 255))  # 밝은 작업 표시줄에서도 숫자가 보이게 어두운 바탕
+    box, width = (10, 10, s - 10, s - 10), 24
+    d.ellipse(box, outline=(52, 58, 82, 255), width=width)
+    if fraction > 0.005:
+        d.arc(box, start=-90, end=-90 + 360 * min(fraction, 1.0), fill=color, width=width)
+    text = str(minutes) if minutes < 1000 else "99+"
+    size = {1: 172, 2: 150}.get(len(text), 108)  # 16px에서도 읽히게 숫자를 최대한 크게
+    fill = (150, 155, 175, 255) if dim else (255, 255, 255, 255)
+    d.text((s / 2, s / 2 + 6), text, font=load_font("consolab.ttf", size), fill=fill, anchor="mm")
+    return img.resize((64, 64), Image.LANCZOS)
+
+
 def ring_image(fraction, color, clock, label, size=184, scale=3):
     """원형 타이머. 남은 비율만큼 12시 방향부터 시계 방향으로 채운다."""
     s = size * scale
@@ -922,6 +958,33 @@ class TimeAlarm:
     def today_counts(self):
         with self.lock:
             return dict(self.records["counts"].get(datetime.date.today().isoformat(), {"work": 0, "break": 0}))
+
+    def today_usage_seconds(self, now=None):
+        """오늘 시작한 사용 기록의 합. 지금 쓰는 기록은 현재 시각까지 센다."""
+        now = now or datetime.datetime.now()
+        with self.lock:
+            sessions = [dict(s) for s in self.records["sessions"]]
+            current = self.session["start"]
+        total = 0.0
+        for session in sessions:
+            start = parse_ts(session["start"])
+            if start.date() != now.date():
+                continue
+            end = now if session["start"] == current else parse_ts(session["end"])
+            total += max(0.0, (end - start).total_seconds())
+        return total
+
+    def today_events_count(self, now=None):
+        """(오늘 일정 수, 그중 아직 시작 전인 일정 수). 기간 일정은 오늘 걸쳐 있으면 센다."""
+        now = now or datetime.datetime.now()
+        today = now.date()
+        with self.lock:
+            events = [dict(e) for e in self.store["events"] if occurs_on(e, today)]
+        upcoming = [
+            e for e in events
+            if not is_period(e) and datetime.datetime.combine(today, event_dt(e).time()) > now
+        ]
+        return len(events), len(upcoming)
 
     def records_snapshot(self):
         with self.lock:
@@ -1086,6 +1149,7 @@ class TimeAlarm:
                 last_beat = time.monotonic()
                 self.heartbeat()
                 self.save_cycle_state()
+            self.refresh_icon()  # 남은 분이 바뀌면 트레이 숫자를 갱신 (안 바뀌면 아무것도 안 함)
 
             if time.monotonic() - last_game_check >= GAME_CHECK_SEC:
                 last_game_check = time.monotonic()
@@ -1229,19 +1293,57 @@ class TimeAlarm:
             self.say(f"게임 중에 놓친 알림이 {len(texts)}개 있습니다. " + " ".join(texts))
         self.refresh_icon()
 
+    def next_alarm_text(self):
+        """다음 알람을 (언제, 문구, 얼마 뒤)로. 계산은 1분에 한 번이나 설정이 바뀔 때만 한다."""
+        now = datetime.datetime.now()
+        key = (self.store_version, now.strftime("%Y%m%d%H%M"))
+        if key != getattr(self, "_next_key", None):
+            self._next_key = key
+            self._next = self.next_alarm()
+        if not self._next:
+            return None
+        at, alarm = self._next
+        minutes = math.ceil((at - now).total_seconds() / 60)
+        days = (at.date() - now.date()).days
+        when = at.strftime("%H:%M")
+        if days == 1:
+            when = "내일 " + when
+        elif days > 1:
+            when = f"{at.month}/{at.day} {when}"
+        return when, alarm["message"], ("곧" if minutes <= 0 else f"{fmt_left(minutes)} 뒤")
+
     def refresh_icon(self):
-        if self.paused:
-            key, state = "paused", "일시정지"
-        elif self.gaming:
-            key, state = "game", "게임 중 (알림 보류)"
-        elif not self.store["cycle"]["enabled"]:
+        """트레이 아이콘(남은 분 숫자)과 마우스를 올렸을 때 보이는 설명을 바꾼다. 바뀐 게 있을 때만 다시 그린다."""
+        snap = self.cycle_snapshot()
+        cycle = snap["cycle"]
+        minutes = math.ceil(snap["left"] / 60)
+        fraction = snap["left"] / snap["total"] if snap["total"] else 0
+        work = snap["phase"] == "work"
+        if not cycle["enabled"]:
             key, state = "off", "메인 알람 꺼짐"
-        elif self.phase == "work":
-            key, state = "work", "작업 중"
+        elif snap["paused"]:
+            key, state = "paused", f"일시정지 · {minutes}분 남음"
+        elif self.gaming:
+            key, state = "game", f"게임 중 (알림 보류) · {'휴식' if work else '작업'}까지 {minutes}분"
+        elif work:
+            key, state = "work", f"작업 중 · 휴식까지 {minutes}분"
         else:
-            key, state = "break", "휴식 중"
-        self.icon.icon = make_icon(COLORS[key])
-        self.icon.title = f"{APP_NAME} - {state}"
+            key, state = "break", f"휴식 중 · 작업까지 {minutes}분"
+        tooltip = f"{APP_NAME}\n{state}"
+        upcoming = self.next_alarm_text()
+        if upcoming:
+            tooltip += f"\n다음: {upcoming[0]} {clip(upcoming[1], 20)} ({upcoming[2]})"
+        tooltip = tooltip[:127]  # Windows 트레이 설명 글자 수 한도
+
+        icon_key = (key, minutes, round(fraction, 2), tooltip, snap["paused"])
+        if icon_key == getattr(self, "_icon_key", None):
+            return
+        self._icon_key = icon_key
+        if key == "off":
+            self.icon.icon = make_icon(COLORS["off"])
+        else:
+            self.icon.icon = tray_icon_image(minutes, fraction, COLORS[key], dim=key == "paused")
+        self.icon.title = tooltip
         self.icon.update_menu()
 
     # ----- 트레이 메뉴 (트레이 스레드에서 불림) -----
@@ -1337,6 +1439,7 @@ class MainWindow:
         }
         self.show_page("main")
         self.clear_form()
+        self.build_widget()
 
     # ----- 공통 위젯 -----
     def font(self, size=13, weight="normal", mono=False):
@@ -2770,6 +2873,40 @@ class MainWindow:
         if autostart_enabled():
             self.autostart_switch.select()
 
+        mini = self.card(page)
+        mini.pack(fill="x", pady=(12, 0))
+        top = ctk.CTkFrame(mini, fg_color="transparent")
+        top.pack(fill="x", padx=18, pady=(16, 0))
+        text = ctk.CTkFrame(top, fg_color="transparent")
+        text.pack(side="left")
+        self.label(text, "작업 표시줄 위 미니 위젯", 14, "bold").pack(anchor="w")
+        self.label(
+            text, "화면 오른쪽 아래에 작게 띄워요. 끌어서 옮길 수 있고, 게임 중에는 숨어요.",
+            12, color=C["sub"],
+        ).pack(anchor="w")
+        self.widget_switch = self.switch(top, lambda: self.set_widget_enabled(bool(self.widget_switch.get())))
+        self.widget_switch.pack(side="right")
+        if self.app.store["widget"]["enabled"]:
+            self.widget_switch.select()
+        self.button(top, "위치 초기화", self.reset_widget_position, width=96).pack(side="right", padx=(0, 14))
+
+        ctk.CTkFrame(mini, height=1, fg_color=C["line"]).pack(fill="x", padx=18, pady=(14, 10))
+        self.label(mini, "표시할 항목", 12, "bold", C["sub"]).pack(anchor="w", padx=18)
+        checks = ctk.CTkFrame(mini, fg_color="transparent")
+        checks.pack(fill="x", padx=18, pady=(6, 16))
+        self.widget_checks = {}
+        items = self.app.store["widget"]["items"]
+        for i, (key, (name, _)) in enumerate(WIDGET_ITEMS.items()):
+            check = ctk.CTkCheckBox(
+                checks, text=name, font=self.font(12), text_color=C["fg"], fg_color=C["accent"],
+                hover_color=C["accent_hover"], border_color=C["line_hl"], checkbox_width=20, checkbox_height=20,
+                command=lambda k=key: self.toggle_widget_item(k),
+            )
+            check.grid(row=i // 4, column=i % 4, sticky="w", padx=(0, 18), pady=4)
+            if items.get(key):
+                check.select()
+            self.widget_checks[key] = check
+
         data = self.card(page)
         data.pack(fill="x", pady=(12, 0))
         info = ctk.CTkFrame(data, fg_color="transparent")
@@ -2785,6 +2922,18 @@ class MainWindow:
         self.settings_msg.pack(anchor="w", pady=(10, 0))
         self.label(page, f"{APP_NAME} ({APP_NAME_EN}) v{APP_VERSION}", 12, color=C["dim"]).pack(side="bottom", anchor="w")
         return page
+
+    def toggle_widget_item(self, key):
+        checked = bool(self.widget_checks[key].get())
+        items = dict(self.app.store["widget"]["items"])
+        items[key] = checked
+        if not any(items.values()):
+            # 모두 끄면 위젯이 비어 버리니 최소 1개는 남긴다
+            self.widget_checks[key].select()
+            self.flash(self.settings_msg, "미니 위젯에는 최소 1개 항목이 있어야 해요.", C["warn"])
+            return
+        self.app.update_store(lambda s: s["widget"].__setitem__("items", items))
+        self.apply_widget_layout()
 
     def toggle_autostart(self):
         enabled = bool(self.autostart_switch.get())
@@ -3060,6 +3209,208 @@ class MainWindow:
             self.gamebar.grid_remove()
             self.gamebar_shown = False
         self.update_game_status()
+        self.update_widget(snap, clock)
+
+    # ----- 작업 표시줄 위 미니 위젯 -----
+    WIDGET_KEY = "#010203"  # 이 색은 투명하게 처리해서 위젯 모서리를 둥글게 보이게 한다
+
+    def build_widget(self):
+        # customtkinter 창은 시작할 때 제목 표시줄을 손보느라 테두리 없는 창과 잘 안 맞아서 tk 창을 쓴다
+        widget = tk.Toplevel(self.root, bg=self.WIDGET_KEY)
+        widget.withdraw()
+        widget.overrideredirect(True)  # 제목 표시줄 없이
+        widget.attributes("-topmost", True)
+        try:
+            widget.attributes("-transparentcolor", self.WIDGET_KEY)
+            widget.attributes("-alpha", 0.96)
+        except tk.TclError:
+            pass
+        box = ctk.CTkFrame(
+            widget, fg_color=C["card"], bg_color=self.WIDGET_KEY, border_width=1,
+            border_color=C["line_hl"], corner_radius=12,
+        )
+        box.pack()
+        self.w_box = box
+
+        # 항목마다 조각(segment)을 만들어 두고, 설정에서 고른 것만 순서대로 붙인다
+        self.w_segments, self.w_seps = {}, {}
+        for key in WIDGET_ITEMS:
+            self.w_segments[key] = ctk.CTkFrame(box, fg_color=C["card"])
+            # customtkinter 프레임은 1px 폭을 그리지 못해서 구분선은 기본 tk 프레임으로
+            self.w_seps[key] = tk.Frame(box, width=1, height=18, bg=C["line_hl"], bd=0, highlightthickness=0)
+        main = self.w_segments["main"]
+        self.w_dot = self.label(main, "●", 12, color=C["accent"], height=24)
+        self.w_dot.pack(side="left", padx=(0, 6))
+        self.w_phase = self.label(main, "", 12, "bold", height=24)
+        self.w_phase.pack(side="left")
+        self.w_clock = self.label(main, "", 14, "bold", mono=True, height=24)
+        self.w_clock.pack(side="left", padx=(6, 0))
+        self.w_texts = {}
+        for key, color, mono in [
+            ("next", C["sub"], False), ("counts", C["mode"], False), ("events", C["fg"], False),
+            ("usage", C["fg"], False), ("date", C["fg"], False), ("clock", C["fg"], True),
+        ]:
+            text = self.label(self.w_segments[key], "", 13 if mono else 12, "bold" if mono else "normal",
+                              color, mono=mono, height=24)
+            text.pack(side="left")
+            self.w_texts[key] = text
+
+        self.w_menu = tk.Menu(widget, tearoff=0)
+        self.w_menu.add_command(label="창 열기", command=lambda: self.app.ui_requests.put("show"))
+        self.w_menu.add_command(label="위치 초기화", command=self.reset_widget_position)
+        self.w_menu.add_separator()
+        self.w_menu.add_command(label="위젯 숨기기", command=lambda: self.set_widget_enabled(False))
+        parts = [widget, box, self.w_dot, self.w_phase, self.w_clock, *self.w_segments.values(),
+                 *self.w_seps.values(), *self.w_texts.values()]
+        for part in parts:
+            part.bind("<ButtonPress-1>", self.widget_press)
+            part.bind("<B1-Motion>", self.widget_drag)
+            part.bind("<ButtonRelease-1>", self.widget_release)
+            part.bind("<Double-Button-1>", lambda _e: self.app.ui_requests.put("show"))
+            part.bind("<Button-3>", lambda e: self.w_menu.tk_popup(e.x_root, e.y_root))
+        self.widget = widget
+        self.widget_shown = False
+        self.widget_drag_from = None
+        self.widget_layout = None
+        self.apply_widget_layout()
+
+    def apply_widget_layout(self):
+        """설정에서 고른 항목만 정해진 순서로 붙이고, 사이에 구분선을 넣는다."""
+        items = self.app.store["widget"]["items"]
+        layout = tuple(key for key in WIDGET_ITEMS if items.get(key))
+        if layout == self.widget_layout:
+            return
+        self.widget_layout = layout
+        for key in WIDGET_ITEMS:
+            self.w_segments[key].pack_forget()
+            self.w_seps[key].pack_forget()
+        for i, key in enumerate(layout):
+            if i:
+                self.w_seps[key].pack(side="left")
+            last = i == len(layout) - 1
+            self.w_segments[key].pack(side="left", padx=(14 if i == 0 else 10, 14 if last else 10), pady=6)
+
+    def work_area(self):
+        """작업 표시줄을 뺀 화면 영역 (왼쪽, 위, 오른쪽, 아래).
+        작업 표시줄 '자동 숨기기'를 쓰면 Windows가 화면 전체를 돌려주므로, 작업 표시줄 위치를 직접 읽어 빼 준다."""
+        screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        rect = (ctypes.c_long * 4)()
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):  # SPI_GETWORKAREA
+            left, top, right, bottom = tuple(rect)
+        else:
+            left, top, right, bottom = 0, 0, screen_w, screen_h
+        taskbar = ctypes.windll.user32.FindWindowW("Shell_TrayWnd", None)
+        bar = (ctypes.c_long * 4)()
+        if taskbar and ctypes.windll.user32.GetWindowRect(taskbar, ctypes.byref(bar)):
+            bar_left, bar_top, bar_right, bar_bottom = tuple(bar)
+            # 숨어 있는 작업 표시줄은 화면 밖으로 내려가 있으므로 위치 대신 두께만큼 비운다
+            if bar_top > screen_h / 2:  # 아래쪽 작업 표시줄
+                bottom = min(bottom, screen_h - (bar_bottom - bar_top))
+            elif bar_left > screen_w / 2:  # 오른쪽 작업 표시줄
+                right = min(right, screen_w - (bar_right - bar_left))
+        return left, top, right, bottom
+
+    def place_widget(self):
+        widget = self.widget
+        widget.update_idletasks()
+        width, height = widget.winfo_reqwidth(), widget.winfo_reqheight()
+        pos = self.app.store["widget"].get("pos")
+        screen_w, screen_h = widget.winfo_screenwidth(), widget.winfo_screenheight()
+        if pos and 0 <= pos[0] < screen_w - 40 and 0 <= pos[1] < screen_h - 20:
+            x, y = pos
+        else:
+            # 기본 위치: 오른쪽 아래, 작업 표시줄 바로 위 (글자 길이가 바뀌어도 오른쪽에 붙어 있게)
+            left, top, right, bottom = self.work_area()
+            x, y = right - width - 12, bottom - height - 10
+        widget.geometry(f"+{int(x)}+{int(y)}")
+
+    def widget_press(self, event):
+        self.widget_drag_from = (event.x_root - self.widget.winfo_x(), event.y_root - self.widget.winfo_y())
+        self.widget_moved = None
+
+    def widget_drag(self, event):
+        if self.widget_drag_from:
+            dx, dy = self.widget_drag_from
+            self.widget_moved = [event.x_root - dx, event.y_root - dy]
+            self.widget.geometry(f"+{self.widget_moved[0]}+{self.widget_moved[1]}")
+
+    def widget_release(self, _event):
+        if self.widget_drag_from and self.widget_moved:
+            pos = list(self.widget_moved)  # 창이 실제로 옮겨지기 전이라 계산한 좌표를 저장한다
+            self.app.update_store(lambda s: s["widget"].__setitem__("pos", pos))
+        self.widget_drag_from = None
+
+    def reset_widget_position(self):
+        self.app.update_store(lambda s: s["widget"].__setitem__("pos", None))
+        self.place_widget()
+        if hasattr(self, "settings_msg"):
+            self.flash(self.settings_msg, "미니 위젯을 오른쪽 아래로 옮겼어요.")
+
+    def set_widget_enabled(self, enabled):
+        self.app.update_store(lambda s: s["widget"].__setitem__("enabled", enabled))
+        if hasattr(self, "widget_switch"):
+            self.widget_switch.select() if enabled else self.widget_switch.deselect()
+
+    def update_widget(self, snap, clock):
+        """메인 알람 상태와 다음 알람을 위젯에 보여 준다. 게임 중이거나 꺼 두었으면 숨긴다."""
+        visible = self.app.store["widget"]["enabled"] and not self.app.gaming
+        if not visible:
+            if self.widget_shown:
+                self.widget.withdraw()
+                self.widget_shown = False
+            return
+        cycle = snap["cycle"]
+        if not cycle["enabled"]:
+            phase, color, clock = "꺼짐", C["dim"], "--:--"
+        elif snap["paused"]:
+            phase, color = "일시정지", C["sub"]
+        elif snap["phase"] == "work":
+            phase, color = "작업", C["accent"]
+        else:
+            phase, color = "휴식", C["brk"]
+        self.apply_widget_layout()
+        items = self.app.store["widget"]["items"]
+        now = datetime.datetime.now()
+        if items.get("main"):
+            self.w_dot.configure(text_color=color)
+            self.w_phase.configure(text=phase, text_color=color if snap["phase"] == "break" else C["fg"])
+            self.w_clock.configure(text=clock)
+        if items.get("next"):
+            upcoming = self.app.next_alarm_text()
+            if upcoming:
+                when, message, left = upcoming
+                self.w_texts["next"].configure(text=f"다음 {when} {clip(message, 12)} · {left}")
+            else:
+                self.w_texts["next"].configure(text="다음 알람 없음")
+        if items.get("counts"):
+            counts = self.app.today_counts()
+            self.w_texts["counts"].configure(text=f"작업 {counts['work']} · 휴식 {counts['break']}")
+        if items.get("events"):
+            total, left = self.app.today_events_count(now)
+            text = f"오늘 일정 {total}개" if total else "오늘 일정 없음"
+            if total and left != total:
+                text += f" · 남은 {left}"
+            self.w_texts["events"].configure(text=text)
+        if items.get("usage"):
+            self.w_texts["usage"].configure(text=f"사용 {fmt_duration(self.app.today_usage_seconds(now))}")
+        if items.get("date"):
+            today = now.date()
+            lunar = lunar_short(today)
+            holiday = holiday_name(today)
+            text = f"{today.month}/{today.day} ({WEEKDAYS[today.weekday()]})" + (f" · 음 {lunar}" if lunar else "")
+            self.w_texts["date"].configure(
+                text=text + (f" · {holiday}" if holiday else ""), text_color=C["warn"] if holiday else C["fg"]
+            )
+        if items.get("clock"):
+            self.w_texts["clock"].configure(text=now.strftime("%H:%M"))
+        if not self.widget_shown:
+            self.place_widget()
+            self.widget.deiconify()
+            self.widget_shown = True
+        elif not self.app.store["widget"].get("pos") and not self.widget_drag_from:
+            # 기본 위치(오른쪽 아래)면 글자 길이가 바뀌어도 오른쪽 끝에 맞춘다
+            self.place_widget()
+        self.widget.lift()
 
     def poll(self):
         while True:
