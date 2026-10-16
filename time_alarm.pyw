@@ -1,4 +1,4 @@
-"""시간 알림: 작업/휴식 사이클과 특정 시각 알람을 음성으로 알려 준다."""
+"""눈치백단타이머 (Nunchi 100): 작업/휴식 사이클과 일정을 음성으로 알려 준다."""
 
 import asyncio
 import ctypes
@@ -23,12 +23,16 @@ import customtkinter as ctk
 import pystray
 from PIL import Image, ImageDraw, ImageFont
 
-APP_VERSION = "1.0.0"
+APP_NAME = "눈치백단타이머"
+APP_NAME_EN = "Nunchi 100"
+APP_VERSION = "1.1.0"
 
 BASE_DIR = Path(__file__).resolve().parent
 STORE_PATH = BASE_DIR / "alarms.json"
 # 'PC 켜면 자동으로 실행'은 Windows 시작 프로그램 폴더의 바로가기로 켜고 끈다
-STARTUP_LINK = Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs/Startup/시간 알림.lnk"
+STARTUP_DIR = Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs/Startup"
+STARTUP_LINK = STARTUP_DIR / f"{APP_NAME}.lnk"
+OLD_STARTUP_LINK = STARTUP_DIR / "시간 알림.lnk"  # v1.0.0 때 이름
 RECORDS_PATH = BASE_DIR / "records.json"
 BACKUP_DIR = BASE_DIR / "기록 백업"
 
@@ -424,6 +428,12 @@ class Speaker:
 
 def autostart_enabled():
     return STARTUP_LINK.exists()
+
+
+def migrate_old_startup_link():
+    """예전 이름(시간 알림)으로 등록된 자동 실행 바로가기를 새 이름으로 옮긴다."""
+    if OLD_STARTUP_LINK.exists() and set_autostart(True):
+        OLD_STARTUP_LINK.unlink(missing_ok=True)
 
 
 def set_autostart(enabled):
@@ -826,6 +836,7 @@ class TimeAlarm:
         self.event_fired = set()  # 이미 알린 (일정 id, 남은 분)
         self.brief_pending = True  # 켜진 직후, 절전에서 깬 뒤, 잠금을 푼 뒤에 오늘 브리핑을 확인한다
         self.first_run = not STORE_PATH.exists()  # 처음 실행이면 창을 바로 띄워 준다
+        migrate_old_startup_link()
         self.store = load_store()
         self.store_version = 0
         self.records = load_records()
@@ -840,7 +851,7 @@ class TimeAlarm:
         self.icon = pystray.Icon(
             "time_alarm",
             make_icon(COLORS["work"]),
-            "시간 알림",
+            APP_NAME,
             menu=pystray.Menu(
                 pystray.MenuItem("열기", self.on_open, default=True),
                 pystray.MenuItem("음성 테스트", self.on_test),
@@ -1141,17 +1152,17 @@ class TimeAlarm:
 
     def refresh_icon(self):
         if self.paused:
-            key, title = "paused", "시간 알림 - 일시정지"
+            key, state = "paused", "일시정지"
         elif self.gaming:
-            key, title = "game", "시간 알림 - 게임 중 (알림 보류)"
+            key, state = "game", "게임 중 (알림 보류)"
         elif not self.store["cycle"]["enabled"]:
-            key, title = "off", "시간 알림 - 메인 알람 꺼짐"
+            key, state = "off", "메인 알람 꺼짐"
         elif self.phase == "work":
-            key, title = "work", "시간 알림 - 작업 중"
+            key, state = "work", "작업 중"
         else:
-            key, title = "break", "시간 알림 - 휴식 중"
+            key, state = "break", "휴식 중"
         self.icon.icon = make_icon(COLORS[key])
-        self.icon.title = title
+        self.icon.title = f"{APP_NAME} - {state}"
         self.icon.update_menu()
 
     # ----- 트레이 메뉴 (트레이 스레드에서 불림) -----
@@ -1211,7 +1222,7 @@ class MainWindow:
         ctk.set_appearance_mode("dark")
         self.root = ctk.CTk(fg_color=C["bg"])
         self.root.withdraw()
-        self.root.title("시간 알림")
+        self.root.title(f"{APP_NAME} ({APP_NAME_EN})")
         try:
             scaling = self.root._get_window_scaling()
         except AttributeError:
@@ -1363,7 +1374,8 @@ class MainWindow:
         side = ctk.CTkFrame(shell, fg_color=C["side"], corner_radius=0, width=184)
         side.grid(row=0, column=0, sticky="ns")
         side.pack_propagate(False)
-        self.label(side, "시간 알림", 16, "bold").pack(anchor="w", padx=20, pady=(20, 16))
+        self.label(side, APP_NAME, 16, "bold").pack(anchor="w", padx=20, pady=(20, 0))
+        self.label(side, APP_NAME_EN, 11, "bold", C["mode"], mono=True).pack(anchor="w", padx=20, pady=(0, 14))
 
         self.nav = {}
         for key, text, glyph in NAV:
@@ -2690,7 +2702,7 @@ class MainWindow:
 
         self.settings_msg = self.label(page, "", 12)
         self.settings_msg.pack(anchor="w", pady=(10, 0))
-        self.label(page, f"시간 알림 v{APP_VERSION}", 12, color=C["dim"]).pack(side="bottom", anchor="w")
+        self.label(page, f"{APP_NAME} ({APP_NAME_EN}) v{APP_VERSION}", 12, color=C["dim"]).pack(side="bottom", anchor="w")
         return page
 
     def toggle_autostart(self):
