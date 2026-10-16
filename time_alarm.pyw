@@ -29,6 +29,10 @@ APP_VERSION = "1.1.0"
 
 BASE_DIR = Path(__file__).resolve().parent
 STORE_PATH = BASE_DIR / "alarms.json"
+# 메인 알람 진행 상태: 프로그램만 다시 켰을 때 타이머를 이어가려고 저장한다
+STATE_PATH = BASE_DIR / "state.json"
+# 다시 켰을 때 '실제 흐른 시간 - PC가 깨어 있던 시간'이 이보다 크면 그 사이 PC가 꺼졌거나 절전했던 것
+OFF_TOLERANCE_SEC = 60
 # 'PC 켜면 자동으로 실행'은 Windows 시작 프로그램 폴더의 바로가기로 켜고 끈다
 STARTUP_DIR = Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs/Startup"
 STARTUP_LINK = STARTUP_DIR / f"{APP_NAME}.lnk"
@@ -424,6 +428,14 @@ class Speaker:
                 pass
             finally:
                 self.ducker.restore()
+
+
+def awake_seconds():
+    """PC가 깨어 있던 시간(초). 절전·최대 절전·빠른 시작 종료 동안은 세지 않고, 재부팅하면 0부터 다시 센다."""
+    value = ctypes.c_ulonglong()
+    if ctypes.windll.kernel32.QueryUnbiasedInterruptTime(ctypes.byref(value)):
+        return value.value / 10_000_000  # 100ns 단위
+    return None
 
 
 def autostart_enabled():
@@ -863,7 +875,12 @@ class TimeAlarm:
                 pystray.MenuItem("종료", self.on_quit),
             ),
         )
-        self.restart_cycle()
+        # 프로그램만 다시 켰으면 메인 알람을 이어가고, PC를 껐다 켰으면 새로 시작한다
+        if self.restore_cycle_state():
+            self.save_cycle_state()
+            self.refresh_icon()
+        else:
+            self.restart_cycle()
 
     def update_store(self, change):
         with self.lock:
@@ -945,7 +962,67 @@ class TimeAlarm:
             self.paused = False
             self.cycle_no = 1
             self.cycle_started = datetime.datetime.now()
+        self.save_cycle_state()
         self.refresh_icon()
+
+    def save_cycle_state(self):
+        """메인 알람 진행 상태를 저장한다. 끝나는 시각은 실제 시계 기준으로 적어 둔다."""
+        with self.lock:
+            cycle = self.store["cycle"]
+            state = {
+                "saved_at": time.time(),
+                "awake": awake_seconds(),
+                "phase": self.phase,
+                "phase_end": time.time() + (self.phase_end - time.monotonic()),
+                "paused": self.paused,
+                "paused_remaining": self.paused_remaining,
+                "cycle_no": self.cycle_no,
+                "cycle_started": to_ts(self.cycle_started),
+                "work_min": cycle["work_min"],
+                "break_min": cycle["break_min"],
+            }
+        try:
+            tmp = STATE_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state), encoding="utf-8")
+            os.replace(tmp, STATE_PATH)
+        except OSError:
+            pass
+
+    def restore_cycle_state(self):
+        """프로그램만 다시 켠 경우 메인 알람을 이어간다. PC가 꺼졌거나 절전했었다면 False."""
+        try:
+            state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        now, awake = time.time(), awake_seconds()
+        if awake is None or state.get("awake") is None:
+            return False
+        wall_gap = now - state["saved_at"]
+        awake_gap = awake - state["awake"]
+        if wall_gap < 0 or awake_gap < 0:
+            return False  # 재부팅해서 '깨어 있던 시간'이 0부터 다시 시작됨
+        if wall_gap - awake_gap > OFF_TOLERANCE_SEC:
+            return False  # 그 사이 PC를 껐거나(빠른 시작) 절전·최대 절전했음
+        cycle = self.store["cycle"]
+        if (state["work_min"], state["break_min"]) != (cycle["work_min"], cycle["break_min"]):
+            return False  # 작업/휴식 시간 설정이 바뀌었음
+
+        phase, phase_end, cycle_no = state["phase"], state["phase_end"], state["cycle_no"]
+        if not state["paused"]:
+            # 꺼져 있던 동안 지나간 단계는 조용히 건너뛴다 (막 지난 단계 하나는 루프가 알려 준다)
+            while phase_end < now - OFF_TOLERANCE_SEC:
+                if phase == "work":
+                    phase, phase_end = "break", phase_end + cycle["break_min"] * 60
+                else:
+                    phase, phase_end, cycle_no = "work", phase_end + cycle["work_min"] * 60, cycle_no + 1
+        with self.lock:
+            self.phase = phase
+            self.phase_end = time.monotonic() + (phase_end - now)
+            self.paused = state["paused"]
+            self.paused_remaining = state["paused_remaining"]
+            self.cycle_no = cycle_no
+            self.cycle_started = parse_ts(state["cycle_started"])
+        return True
 
     def cycle_snapshot(self):
         with self.lock:
@@ -1008,6 +1085,7 @@ class TimeAlarm:
             if time.monotonic() - last_beat >= HEARTBEAT_SEC:
                 last_beat = time.monotonic()
                 self.heartbeat()
+                self.save_cycle_state()
 
             if time.monotonic() - last_game_check >= GAME_CHECK_SEC:
                 last_game_check = time.monotonic()
@@ -1042,6 +1120,7 @@ class TimeAlarm:
                     self.phase_end = time.monotonic() + cycle["work_min"] * 60
                     self.cycle_no += 1
                     template = cycle["work_msg"]
+            self.save_cycle_state()
             self.count_phase(finished)
             self.notify(cycle_message(template, cycle), "cycle")
             self.refresh_icon()
@@ -1181,6 +1260,7 @@ class TimeAlarm:
             else:
                 self.paused_remaining = max(0.0, self.phase_end - time.monotonic())
                 self.paused = True
+        self.save_cycle_state()
         self.refresh_icon()
 
     def on_restart(self, *_):
@@ -1199,6 +1279,7 @@ class TimeAlarm:
         finally:
             self.stop_event.set()
             self.heartbeat()  # 종료 시각을 남긴다
+            self.save_cycle_state()
             self.icon.stop()
 
 

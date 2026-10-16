@@ -1,6 +1,7 @@
 # 개인 데이터 (각자 PC에서 처음 실행할 때 새로 만들어짐)
 alarms.json
 records.json
+state.json
 *.tmp
 기록 백업/
 
