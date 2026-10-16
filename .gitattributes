@@ -1,0 +1,5 @@
+# Windows 배치 파일은 CRLF 줄바꿈이어야 안전하게 실행된다
+*.bat text eol=crlf
+*.py text eol=lf
+*.pyw text eol=lf
+*.md text eol=lf

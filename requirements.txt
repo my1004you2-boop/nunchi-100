@@ -1,0 +1,8 @@
+customtkinter>=6.0.0
+pystray>=0.19.5
+pillow>=10.1.0
+edge-tts>=7.0.0
+pycaw>=20240316
+comtypes>=1.4.0
+holidays>=0.106
+korean-lunar-calendar>=0.3.1
