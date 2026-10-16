@@ -25,7 +25,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "눈치백단타이머"
 APP_NAME_EN = "Nunchi 100"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 
 BASE_DIR = Path(__file__).resolve().parent
 STORE_PATH = BASE_DIR / "alarms.json"
@@ -1701,10 +1701,20 @@ class MainWindow:
 
     def save_cycle(self):
         cycle = self.read_cycle_form()
-        if cycle:
-            self.app.update_store(lambda s: s.__setitem__("cycle", cycle))
+        if not cycle:
+            return
+        with self.app.lock:
+            old = self.app.store["cycle"]
+            time_changed = (old["work_min"], old["break_min"]) != (cycle["work_min"], cycle["break_min"])
+        self.app.update_store(lambda s: s.__setitem__("cycle", cycle))
+        if time_changed:
+            # 작업/휴식 시간이 바뀌면 남은 시간이 맞지 않으니 새로 시작한다
             self.app.restart_cycle()
-            self.flash(self.cycle_msg, "저장했어요. 작업 시간이 지금부터 새로 시작돼요.")
+            self.flash(self.cycle_msg, "저장했어요. 바뀐 시간으로 작업이 지금부터 새로 시작돼요.")
+        else:
+            # 문구만 바뀌었으면 타이머는 그대로 두고, 다음 알림부터 새 문구로 읽는다
+            self.app.save_cycle_state()
+            self.flash(self.cycle_msg, "문구를 저장했어요. 타이머는 그대로 이어지고 다음 알림부터 새 문구로 읽어요.")
 
     def preview_cycle(self):
         cycle = self.read_cycle_form()
