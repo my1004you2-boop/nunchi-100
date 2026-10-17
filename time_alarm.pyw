@@ -25,7 +25,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "눈치백단타이머"
 APP_NAME_EN = "Nunchi 100"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.6.0"
 
 BASE_DIR = Path(__file__).resolve().parent
 STORE_PATH = BASE_DIR / "alarms.json"
@@ -88,6 +88,17 @@ WIDGET_ITEMS = {
     "clock": ("현재 시각", False),
 }
 DEFAULT_WIDGET_ITEMS = {key: default for key, (_, default) in WIDGET_ITEMS.items()}
+# 알림 종류: 키 → (이름, 팝업이 저절로 닫히는 초 (None이면 [확인]까지), [5분 뒤 다시] 버튼)
+ALERT_KINDS = {
+    "cycle": ("메인 알람 (작업·휴식)", 15, False),
+    "alarm": ("특정 시각 알람", None, True),
+    "event": ("캘린더 일정", None, True),
+    "brief": ("오늘 일정 브리핑", 15, False),
+    "timer": ("타이머", None, True),
+}
+ALERT_MODES = {"voice": "음성", "popup": "팝업", "both": "둘 다"}
+SNOOZE_MIN = 5
+DEFAULT_DAY_START = 5  # 이 시각 전에 켜면 아직 전날로 본다 (새벽 작업 중에 다음 날 브리핑이 나가지 않게)
 
 # 캘린더 일정 알림: 기본으로 몇 분 전부터 알릴지, 고를 수 있는 시작 전 시간과 간격(분)
 EVENT_LEAD_MIN = 120
@@ -152,14 +163,20 @@ FONT_DIR = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
 NAV = [
     ("main", "메인 알람", 0xE916),
     ("alarms", "특정 시각", 0xEA8F),
+    ("timers", "타이머", 0xECC5),
+    ("stopwatch", "스탑워치", 0xE121),
     ("calendar", "캘린더", 0xE787),
-    ("voice", "음성", 0xE767),
+    ("voice", "알림", 0xE767),
     ("games", "게임 목록", 0xE7FC),
     ("records", "사용 기록", 0xE81C),
     ("settings", "설정", 0xE713),
 ]
 
 user32 = ctypes.windll.user32
+
+
+def day_start_text(hours):
+    return "자정 (0시)" if hours == 0 else ("낮 12시" if hours == 12 else f"오전 {hours}시")
 
 
 def load_store():
@@ -174,8 +191,16 @@ def load_store():
         "games": data.get("games", []),
         # 캘린더: [{"id", "date": YYYY-MM-DD, "time": HH:MM, "title", "memo", "interval": 분}]
         "events": data.get("events", []),
+        # 알림 종류별 방식: voice / popup / both (처음엔 모두 음성)
+        "alert_modes": {
+            **{kind: "voice" for kind in ALERT_KINDS},
+            **{k: v for k, v in data.get("alert_modes", {}).items() if k in ALERT_KINDS and v in ALERT_MODES},
+        },
+        # 멀티 타이머 목록: [{"id", "name", "seconds"}] (돌고 있는 상태는 저장하지 않는다)
+        "timers": data.get("timers", []),
         "briefing": data.get("briefing", True),  # PC를 켤 때 오늘 일정 브리핑
         "briefed_on": data.get("briefed_on"),  # 마지막으로 브리핑한 날짜
+        "day_start": data.get("day_start", DEFAULT_DAY_START),  # 하루가 시작되는 시각 (0~12시)
         # 작업 표시줄 위 미니 위젯: 켜짐 여부, 사용자가 옮긴 위치 [x, y] (없으면 오른쪽 아래), 보여 줄 항목
         "widget": {
             "enabled": True,
@@ -283,6 +308,18 @@ def cycle_message(template, cycle):
     return template.format(
         시각=korean_time(), 작업=fmt_min(cycle["work_min"]), 휴식=fmt_min(cycle["break_min"])
     )
+
+
+def fmt_clock(seconds, hundredths=False):
+    """초를 MM:SS 또는 H:MM:SS로. hundredths면 뒤에 .cc를 붙인다 (스탑워치용)."""
+    if hundredths:
+        whole, cs = divmod(int(seconds * 100), 100)
+    else:
+        whole, cs = math.ceil(seconds), 0
+    h, rest = divmod(whole, 3600)
+    m, sec = divmod(rest, 60)
+    text = f"{h}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+    return text + f".{cs:02d}" if hundredths else text
 
 
 def clip(text, limit):
@@ -880,6 +917,9 @@ class TimeAlarm:
         self.gaming = False
         self.active_games = []  # 지금 실행 중인 등록 게임
         self.missed = []  # 게임 중에 보류한 알림 (종류, 문구)
+        # 멀티 타이머 진행 상태: id → {"end": 끝나는 monotonic 시각 (멈췄으면 None), "left": 멈췄을 때 남은 초, "done"}
+        self.timer_runs = {}
+        self.snoozed = []  # [5분 뒤 다시]를 누른 알림: (다시 알릴 monotonic 시각, 종류, 제목, 문구, 팝업 문구)
         self.fired = {}  # 알람 id → 마지막으로 울린 날짜
         self.event_fired = set()  # 이미 알린 (일정 id, 남은 분)
         self.brief_pending = True  # 켜진 직후, 절전에서 깬 뒤, 잠금을 푼 뒤에 오늘 브리핑을 확인한다
@@ -1115,17 +1155,53 @@ class TimeAlarm:
             voice = dict(self.store["voice"])
         self.speaker.say(text, voice)
 
-    def notify(self, text, kind):
-        """일시정지면 버리고, 게임 중이면 보류하고, 아니면 바로 읽는다."""
+    def alert_mode(self, kind):
+        with self.lock:
+            mode = self.store["alert_modes"].get(kind, "voice")
+        return mode in ("voice", "both"), mode in ("popup", "both")
+
+    def popup(self, kind, text, title=None):
+        """화면 팝업은 창 스레드가 띄운다. 게임 중에는 띄우지 않는다."""
+        if not self.gaming:
+            self.ui_requests.put(("popup", {
+                "kind": kind, "title": title or ALERT_KINDS[kind][0], "text": text,
+                "at": datetime.datetime.now().strftime("%H:%M"),
+            }))
+
+    def notify(self, text, kind, title=None, body=None):
+        """일시정지면 버린다. 게임 중이면 음성은 보류하고 팝업은 띄우지 않는다. 아니면 고른 방식대로 알린다.
+        body는 팝업에 보일 문구 (없으면 text). 팝업은 시각을 따로 보여 줘서 '○시 ○분입니다'를 뺀다."""
         if self.paused:
             return
+        voice, popup = self.alert_mode(kind)
         if self.gaming:
-            if kind == "cycle":
-                # 사이클 알림은 가장 최근 것만 의미가 있다
-                self.missed = [m for m in self.missed if m[0] != "cycle"]
-            self.missed.append((kind, text))
+            if voice:
+                if kind == "cycle":
+                    # 사이클 알림은 가장 최근 것만 의미가 있다
+                    self.missed = [m for m in self.missed if m[0] != "cycle"]
+                self.missed.append((kind, text))
             return
-        self.say(text)
+        if voice:
+            self.say(text)
+        if popup:
+            self.popup(kind, body or text, title)
+
+    def snooze(self, item):
+        """팝업의 [5분 뒤 다시]: 같은 알림을 5분 뒤에 다시 보낸다 (창 스레드에서 불림)."""
+        with self.lock:
+            self.snoozed.append((time.monotonic() + SNOOZE_MIN * 60, item["kind"], item["title"], item["text"]))
+
+    def check_snoozes(self):
+        now = time.monotonic()
+        with self.lock:
+            due = [x for x in self.snoozed if x[0] <= now]
+            self.snoozed = [x for x in self.snoozed if x[0] > now]
+        for _, kind, title, text in due:
+            spoken = f"{SNOOZE_MIN}분 전에 미룬 알림입니다. {text}"
+            if kind == "timer":
+                self.timer_alert(title, spoken, text)
+            else:
+                self.notify(spoken, kind, title, text)
 
     def run_loop(self):
         last_wall = time.time()
@@ -1155,6 +1231,8 @@ class TimeAlarm:
                 last_game_check = time.monotonic()
                 self.update_gaming()
             self.check_alarms()
+            self.check_timers()
+            self.check_snoozes()
             self.check_events()
 
             locked = is_locked()
@@ -1206,7 +1284,7 @@ class TimeAlarm:
         if once:
             self.update_store(lambda s: [s["alarms"].remove(a) for a in once])
         for alarm in due:
-            self.notify(f"{korean_time(now)}입니다. {alarm['message']}", "alarm")
+            self.notify(f"{korean_time(now)}입니다. {alarm['message']}", "alarm", body=alarm["message"])
 
     def check_events(self):
         now = datetime.datetime.now()
@@ -1234,17 +1312,67 @@ class TimeAlarm:
                     # 날짜가 다른 일정은 '내일 오후 2시에'처럼 언제인지로 말한다
                     start_at = datetime.datetime.combine(day, event_dt(event).time())
                     when_text = "내일" if day == today + datetime.timedelta(days=1) else f"{day.month}월 {day.day}일"
-                    text = f"{korean_time(now)}입니다. {when_text} {korean_time(start_at)}에 {event['title']} 일정이 있습니다."
+                    body = f"{when_text} {korean_time(start_at)}에 {event['title']} 일정이 있습니다."
                 elif left:
-                    text = f"{korean_time(now)}입니다. {fmt_left(left)} 뒤에 {event['title']} 일정이 있습니다."
+                    body = f"{fmt_left(left)} 뒤에 {event['title']} 일정이 있습니다."
                 else:
-                    text = f"{korean_time(now)}입니다. 지금 {event['title']} 일정 시간입니다."
-                self.notify(text, "alarm")
+                    body = f"지금 {event['title']} 일정 시간입니다."
+                self.notify(f"{korean_time(now)}입니다. {body}", "event", f"일정 · {event['title']}", body)
+
+    # ----- 멀티 타이머 -----
+    def timer_state(self, timer):
+        """(남은 초, 상태). 상태는 idle / running / paused / done. self.lock을 잡고 부른다."""
+        run = self.timer_runs.get(timer["id"])
+        if not run:
+            return timer["seconds"], "idle"
+        if run["done"]:
+            return 0, "done"
+        if run["end"] is None:
+            return run["left"], "paused"
+        return max(0.0, run["end"] - time.monotonic()), "running"
+
+    def timer_start(self, timer):
+        with self.lock:
+            left, state = self.timer_state(timer)
+            if state in ("idle", "done"):
+                left = timer["seconds"]
+            self.timer_runs[timer["id"]] = {"end": time.monotonic() + left, "left": left, "done": False}
+
+    def timer_pause(self, timer):
+        with self.lock:
+            left, state = self.timer_state(timer)
+            if state == "running":
+                self.timer_runs[timer["id"]] = {"end": None, "left": left, "done": False}
+
+    def timer_reset(self, timer_id):
+        with self.lock:
+            self.timer_runs.pop(timer_id, None)
+
+    def check_timers(self):
+        """끝난 타이머를 알린다. 사용자가 직접 켠 타이머라 게임 중이어도 바로 읽는다."""
+        finished = []
+        with self.lock:
+            for timer in self.store["timers"]:
+                run = self.timer_runs.get(timer["id"])
+                if run and not run["done"] and run["end"] is not None and time.monotonic() >= run["end"]:
+                    run["done"] = True
+                    finished.append(timer["name"])
+        for name in finished:
+            self.timer_alert(f"타이머 · {name}", f"{name} 타이머가 끝났습니다.")
+
+    def timer_alert(self, title, text, body=None):
+        """타이머는 사용자가 직접 켠 것이라 일시정지·게임 중이어도 음성은 바로 읽는다 (팝업은 게임 중엔 안 띄움)."""
+        voice, popup = self.alert_mode("timer")
+        if voice:
+            self.say(text)
+        if popup:
+            self.popup("timer", body or text, title)
 
     def brief_today(self):
-        """그날 처음 한 번, 오늘 일정을 읽어 준다."""
-        today = datetime.date.today()
+        """그날 처음 한 번, 오늘 일정을 읽어 준다. '오늘'은 설정한 하루 시작 시각부터 센다."""
         with self.lock:
+            hours = self.store["day_start"]
+            today = (datetime.datetime.now() - datetime.timedelta(hours=hours)).date()
             if not self.store["briefing"] or self.store["briefed_on"] == today.isoformat():
                 return
             events = sorted(
@@ -1276,7 +1404,7 @@ class TimeAlarm:
                 left = (event_end(e) - today).days
                 items.append(f"{e['title']}, " + ("오늘 마감" if left == 0 else f"{left}일 남음"))
             text += " 진행 중인 일정: " + ", ".join(items) + "."
-        self.notify(text, "alarm")
+        self.notify(text, "brief")
 
     def update_gaming(self):
         with self.lock:
@@ -1431,6 +1559,8 @@ class MainWindow:
         self.pages = {
             "main": self.build_main_page(content),
             "alarms": self.build_alarm_page(content),
+            "timers": self.build_timer_page(content),
+            "stopwatch": self.build_stopwatch_page(content),
             "calendar": self.build_calendar_page(content),
             "voice": self.build_voice_page(content),
             "games": self.build_game_page(content),
@@ -1571,7 +1701,7 @@ class MainWindow:
                 image=icons[0],
                 compound="left",
                 anchor="w",
-                height=40,
+                height=38,
                 corner_radius=8,
                 fg_color="transparent",
                 hover_color=C["side_hover"],
@@ -1965,6 +2095,255 @@ class MainWindow:
             self.app.say(f"{korean_time()}입니다. {message}")
         else:
             self.flash(self.form_msg, "알림 문구를 입력하세요.", C["warn"])
+
+    # ----- 타이머 화면 -----
+    def build_timer_page(self, parent):
+        page = ctk.CTkFrame(parent, fg_color="transparent")
+        self.page_header(page, "타이머")
+        self.label(
+            page, "여러 개를 동시에 돌릴 수 있어요. 끝나면 게임 중이어도 바로 음성으로 알려 줘요.",
+            12, color=C["sub"],
+        ).pack(anchor="w", pady=(4, 0))
+
+        form = self.card(page)
+        form.pack(fill="x", pady=(12, 0))
+        row = ctk.CTkFrame(form, fg_color="transparent")
+        row.pack(fill="x", padx=18, pady=16)
+        self.label(row, "이름", color=C["sub"]).pack(side="left")
+        self.timer_name = self.entry(row, width=150)
+        self.timer_name.pack(side="left", padx=(8, 16))
+        self.timer_name.bind("<Return>", lambda _e: self.add_timer())
+        self.timer_fields = []
+        for unit, default in (("시간", "0"), ("분", "5"), ("초", "0")):
+            field = self.entry(row, width=46)
+            field.insert(0, default)
+            field.pack(side="left")
+            field.bind("<Return>", lambda _e: self.add_timer())
+            self.label(row, unit, color=C["sub"]).pack(side="left", padx=(4, 10))
+            self.timer_fields.append(field)
+        self.button(row, "추가", self.add_timer, primary=True, width=70).pack(side="right")
+        self.timer_msg = self.label(page, "", 12)
+        self.timer_msg.pack(anchor="w", pady=(6, 0))
+
+        self.timer_list = ctk.CTkScrollableFrame(
+            page,
+            fg_color="transparent",
+            scrollbar_button_color=C["btn"],
+            scrollbar_button_hover_color=C["btn_hover"],
+        )
+        self.timer_list.pack(fill="both", expand=True, pady=(4, 0))
+        self.timer_time_labels = {}
+        self.timer_sig = None
+        self.render_timers()
+        return page
+
+    def add_timer(self):
+        try:
+            h, m, sec = (int(f.get().strip() or 0) for f in self.timer_fields)
+        except ValueError:
+            self.flash(self.timer_msg, "시간·분·초는 숫자로 넣어 주세요.", C["warn"])
+            return
+        seconds = h * 3600 + m * 60 + sec
+        if min(h, m, sec) < 0 or seconds <= 0:
+            self.flash(self.timer_msg, "1초 이상으로 정해 주세요.", C["warn"])
+            return
+        if seconds > 99 * 3600:
+            self.flash(self.timer_msg, "타이머는 99시간까지 정할 수 있어요.", C["warn"])
+            return
+        with self.app.lock:
+            count = len(self.app.store["timers"])
+        name = self.timer_name.get().strip() or f"타이머 {count + 1}"
+        timer = {"id": uuid.uuid4().hex[:8], "name": name, "seconds": seconds}
+        self.app.update_store(lambda s: s["timers"].append(timer))
+        self.timer_name.delete(0, "end")
+        self.flash(self.timer_msg, f"'{name}' 타이머를 추가했어요. [▶ 시작]을 누르면 돌아가요.")
+
+    def delete_timer(self, timer_id):
+        self.app.timer_reset(timer_id)
+        self.app.update_store(lambda s: s.__setitem__("timers", [t for t in s["timers"] if t["id"] != timer_id]))
+
+    def timer_action(self, timer, action):
+        if action == "start":
+            self.app.timer_start(timer)
+        elif action == "pause":
+            self.app.timer_pause(timer)
+        else:
+            self.app.timer_reset(timer["id"])
+        self.update_timers()
+
+    def timer_states(self):
+        with self.app.lock:
+            return [(dict(t), *self.app.timer_state(t)) for t in self.app.store["timers"]]
+
+    @staticmethod
+    def timer_signature(states):
+        return [(t["id"], t["name"], t["seconds"], state) for t, _, state in states]
+
+    def render_timers(self):
+        for child in self.timer_list.winfo_children():
+            child.destroy()
+        self.timer_time_labels = {}
+        states = self.timer_states()
+        self.timer_sig = self.timer_signature(states)
+        if not states:
+            self.label(
+                self.timer_list, "아직 타이머가 없어요. 위에서 이름과 시간을 넣고 [추가]를 눌러 보세요.",
+                12, color=C["sub"],
+            ).pack(anchor="w", pady=10)
+            return
+        for timer, _, state in states:
+            done = state == "done"
+            card_color = C["card_hl"] if state in ("running", "done") else C["card"]
+            card = ctk.CTkFrame(
+                self.timer_list,
+                fg_color=card_color,
+                border_width=1,
+                border_color=C["warn"] if done else (C["accent"] if state == "running" else C["line"]),
+                corner_radius=9,
+            )
+            card.pack(fill="x", pady=3, padx=(0, 6))
+            clock = self.label(card, "", 24, "bold", mono=True, width=130, anchor="w")
+            clock.pack(side="left", padx=(16, 10), pady=10)
+            self.timer_time_labels[timer["id"]] = clock
+            # 버튼을 이름보다 먼저 배치해야 창이 좁아도 버튼이 잘리지 않는다
+            self.button(card, "✕", lambda i=timer["id"]: self.delete_timer(i), width=34).pack(
+                side="right", padx=(4, 14)
+            )
+            self.button(card, "리셋", lambda t=timer: self.timer_action(t, "reset"), width=56).pack(
+                side="right", padx=4
+            )
+            if state == "running":
+                self.button(card, "❚❚ 일시정지", lambda t=timer: self.timer_action(t, "pause"), width=96).pack(
+                    side="right", padx=4
+                )
+            else:
+                label = {"idle": "▶ 시작", "paused": "▶ 계속", "done": "▶ 다시"}[state]
+                self.button(
+                    card, label, lambda t=timer: self.timer_action(t, "start"), primary=True, width=96
+                ).pack(side="right", padx=4)
+            # "transparent"로 두면 카드 안쪽에 바깥 배경색이 비쳐서 카드 색을 직접 지정한다
+            text = ctk.CTkFrame(card, fg_color=card_color)
+            text.pack(side="left", fill="x", expand=True, pady=4)
+            self.label(text, clip(timer["name"], 22), 13, anchor="w").pack(anchor="w")
+            status = {"idle": "대기", "running": "진행 중", "paused": "일시정지", "done": "끝났어요"}[state]
+            ctk.CTkLabel(
+                text, text=f"{fmt_clock(timer['seconds'])}  ·  {status}", height=20, corner_radius=10,
+                fg_color=C["btn"], text_color=C["warn"] if done else C["sub"], font=self.font(11),
+            ).pack(anchor="w", pady=(0, 2))
+        self.update_timers()
+
+    def update_timers(self):
+        """남은 시간 글자만 고친다. 상태가 바뀌었으면(끝남 등) 목록을 다시 그린다."""
+        states = self.timer_states()
+        if self.timer_signature(states) != self.timer_sig:
+            self.render_timers()
+            return
+        for timer, left, state in states:
+            clock = self.timer_time_labels.get(timer["id"])
+            if clock:
+                clock.configure(
+                    text="끝!" if state == "done" else fmt_clock(left),
+                    text_color=C["warn"] if state == "done" else (C["fg"] if state == "running" else C["sub"]),
+                )
+
+    # ----- 스탑워치 화면 -----
+    def build_stopwatch_page(self, parent):
+        page = ctk.CTkFrame(parent, fg_color="transparent")
+        self.page_header(page, "스탑워치")
+        self.sw_started = None  # 재기 시작한 monotonic 시각 (멈춰 있으면 None)
+        self.sw_total = 0.0  # 멈추기 전까지 쌓인 시간
+        self.sw_laps = []  # 랩을 누른 시점의 전체 시간
+        self.sw_job = None
+
+        box = self.card(page, highlight=True)
+        box.pack(fill="x", pady=(14, 0))
+        self.sw_label = self.label(box, fmt_clock(0, True), 54, "bold", mono=True)
+        self.sw_label.pack(pady=(26, 8))
+        buttons = ctk.CTkFrame(box, fg_color="transparent")
+        buttons.pack(pady=(0, 24))
+        self.sw_start_btn = self.button(buttons, "▶ 시작", self.sw_toggle, primary=True, width=110)
+        self.sw_start_btn.pack(side="left", padx=5)
+        self.sw_lap_btn = self.button(buttons, "랩", self.sw_lap, width=90)
+        self.sw_lap_btn.pack(side="left", padx=5)
+        self.sw_reset_btn = self.button(buttons, "리셋", self.sw_reset, width=90)
+        self.sw_reset_btn.pack(side="left", padx=5)
+
+        head = ctk.CTkFrame(page, fg_color="transparent")
+        head.pack(fill="x", padx=(14, 20), pady=(14, 4))
+        self.label(head, "랩", 12, "bold", C["sub"], width=60, anchor="w").pack(side="left")
+        self.label(head, "전체", 12, "bold", C["sub"], width=120, anchor="e").pack(side="right")
+        self.label(head, "구간", 12, "bold", C["sub"], width=120, anchor="e").pack(side="right")
+        self.sw_list = ctk.CTkScrollableFrame(
+            page,
+            fg_color="transparent",
+            scrollbar_button_color=C["btn"],
+            scrollbar_button_hover_color=C["btn_hover"],
+        )
+        self.sw_list.pack(fill="both", expand=True)
+        self.sw_update_buttons()
+        return page
+
+    def sw_elapsed(self):
+        return self.sw_total + (time.monotonic() - self.sw_started if self.sw_started is not None else 0)
+
+    def sw_toggle(self):
+        if self.sw_started is None:
+            self.sw_started = time.monotonic()
+            self.sw_tick()
+        else:
+            self.sw_total = self.sw_elapsed()
+            self.sw_started = None
+            if self.sw_job:
+                self.root.after_cancel(self.sw_job)
+                self.sw_job = None
+            self.sw_label.configure(text=fmt_clock(self.sw_total, True))
+        self.sw_update_buttons()
+
+    def sw_tick(self):
+        self.sw_label.configure(text=fmt_clock(self.sw_elapsed(), True))
+        self.sw_job = self.root.after(30, self.sw_tick)
+
+    def sw_lap(self):
+        if self.sw_started is None:
+            return
+        self.sw_laps.append(self.sw_elapsed())
+        self.render_laps()
+
+    def sw_reset(self):
+        if self.sw_started is not None:
+            return
+        self.sw_total = 0.0
+        self.sw_laps = []
+        self.sw_label.configure(text=fmt_clock(0, True))
+        self.render_laps()
+        self.sw_update_buttons()
+
+    def sw_update_buttons(self):
+        running = self.sw_started is not None
+        self.sw_start_btn.configure(text="❚❚ 일시정지" if running else ("▶ 계속" if self.sw_total else "▶ 시작"))
+        self.sw_lap_btn.configure(state="normal" if running else "disabled")
+        self.sw_reset_btn.configure(state="disabled" if running or not self.sw_total else "normal")
+
+    def render_laps(self):
+        for child in self.sw_list.winfo_children():
+            child.destroy()
+        splits = [b - a for a, b in zip([0.0] + self.sw_laps, self.sw_laps)]
+        # 랩이 2개 이상이면 가장 빠른 구간은 초록, 가장 느린 구간은 빨강
+        best, worst = (min(splits), max(splits)) if len(splits) > 1 else (None, None)
+        for no in range(len(self.sw_laps), 0, -1):  # 최근 랩이 위로
+            split = splits[no - 1]
+            color = C["good"] if split == best else (C["warn"] if split == worst else C["fg"])
+            row = ctk.CTkFrame(self.sw_list, fg_color=C["card"], corner_radius=8)
+            row.pack(fill="x", pady=2, padx=(0, 6))
+            self.label(row, f"랩 {no}", 13, color=C["sub"], width=60, anchor="w").pack(
+                side="left", padx=(14, 0), pady=7
+            )
+            self.label(row, fmt_clock(self.sw_laps[no - 1], True), 14, mono=True, width=120, anchor="e").pack(
+                side="right", padx=(0, 14)
+            )
+            self.label(row, fmt_clock(split, True), 14, color=color, mono=True, width=120, anchor="e").pack(
+                side="right"
+            )
 
     # ----- 캘린더 화면 -----
     def build_calendar_page(self, parent):
@@ -2639,10 +3018,52 @@ class MainWindow:
     def build_voice_page(self, parent):
         with self.app.lock:
             voice = dict(self.app.store["voice"])
-        page = ctk.CTkFrame(parent, fg_color="transparent")
-        self.page_header(page, "음성")
+        # 항목이 많아 작은 창에서도 다 보이도록 스크롤되게 한다
+        page = ctk.CTkScrollableFrame(
+            parent,
+            fg_color="transparent",
+            scrollbar_button_color=C["btn"],
+            scrollbar_button_hover_color=C["btn_hover"],
+        )
+        self.page_header(page, "알림")
+
+        modes = self.card(page)
+        modes.pack(fill="x", pady=(14, 0), padx=(0, 8))
+        top = ctk.CTkFrame(modes, fg_color="transparent")
+        top.pack(fill="x", padx=18, pady=(16, 4))
+        text = ctk.CTkFrame(top, fg_color="transparent")
+        text.pack(side="left")
+        self.label(text, "알림 방식", 14, "bold").pack(anchor="w")
+        self.label(
+            text, "종류마다 음성으로 읽을지, 화면 오른쪽 아래에 팝업을 띄울지 골라요. 게임 중에는 팝업을 띄우지 않아요.",
+            12, color=C["sub"], wraplength=440, justify="left",
+        ).pack(anchor="w")
+        self.button(top, "팝업 미리 보기", self.preview_popup, width=110).pack(side="right")
+        rows = ctk.CTkFrame(modes, fg_color="transparent")
+        rows.pack(fill="x", padx=18, pady=(6, 16))
+        rows.grid_columnconfigure(0, weight=1)
+        self.mode_buttons = {}
+        with self.app.lock:
+            current = dict(self.app.store["alert_modes"])
+        for row, (kind, (name, auto_close, _)) in enumerate(ALERT_KINDS.items()):
+            label = ctk.CTkFrame(rows, fg_color="transparent")
+            label.grid(row=row, column=0, sticky="w", pady=4)
+            self.label(label, name, 13).pack(side="left")
+            hint = f"팝업은 {auto_close}초 뒤 닫힘" if auto_close else "팝업은 [확인]까지 남음"
+            self.label(label, hint, 11, color=C["dim"]).pack(side="left", padx=(8, 0))
+            seg = ctk.CTkSegmentedButton(
+                rows, values=list(ALERT_MODES.values()), width=210, height=30, font=self.font(12),
+                fg_color=C["btn"], selected_color=C["accent"], selected_hover_color=C["accent_hover"],
+                unselected_color=C["btn"], unselected_hover_color=C["btn_hover"], text_color=C["fg"],
+                command=lambda value, k=kind: self.set_alert_mode(k, value),
+            )
+            seg.set(ALERT_MODES[current[kind]])
+            seg.grid(row=row, column=1, sticky="e", pady=4)
+            self.mode_buttons[kind] = seg
+
+        self.label(page, "목소리", 14, "bold").pack(anchor="w", pady=(18, 0))
         box = self.card(page)
-        box.pack(fill="x", pady=(14, 0))
+        box.pack(fill="x", pady=(8, 0), padx=(0, 8))
         box.grid_columnconfigure(1, weight=1)
 
         self.label(box, "목소리", color=C["sub"]).grid(row=0, column=0, sticky="w", padx=(18, 14), pady=(18, 8))
@@ -2721,6 +3142,92 @@ class MainWindow:
             12, color=C["sub"], justify="left",
         ).pack(anchor="w", pady=(10, 0))
         return page
+
+    def set_alert_mode(self, kind, value):
+        mode = next(k for k, v in ALERT_MODES.items() if v == value)
+        self.app.update_store(lambda s: s["alert_modes"].__setitem__(kind, mode))
+        self.flash(self.voice_msg, f"{ALERT_KINDS[kind][0]}: {value}(으)로 알려요.")
+
+    def preview_popup(self):
+        self.show_popup({
+            "kind": "alarm", "title": "미리 보기", "text": "이런 모양으로 화면 오른쪽 아래에 떠요.",
+            "at": datetime.datetime.now().strftime("%H:%M"),
+        })
+
+    # ----- 화면 팝업 -----
+    POPUP_MAX = 5
+
+    def show_popup(self, item):
+        """화면 오른쪽 아래(미니 위젯 위)에 알림 카드를 띄운다. 여러 개면 위로 쌓는다."""
+        if not hasattr(self, "popups"):
+            self.popups = []
+        while len(self.popups) >= self.POPUP_MAX:
+            self.close_popup(self.popups[0])
+        _, auto_close, can_snooze = ALERT_KINDS[item["kind"]]
+        # 미니 위젯과 같은 방식: tk 창 + 투명색으로 둥근 모서리
+        win = tk.Toplevel(self.root, bg=self.WIDGET_KEY)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        try:
+            win.attributes("-transparentcolor", self.WIDGET_KEY)
+        except tk.TclError:
+            pass
+        box = ctk.CTkFrame(
+            win, fg_color=C["card"], bg_color=self.WIDGET_KEY, border_width=1,
+            border_color=C["accent"], corner_radius=12, width=330,
+        )
+        box.pack()
+        head = ctk.CTkFrame(box, fg_color=C["card"])
+        head.pack(fill="x", padx=16, pady=(14, 0))
+        self.label(head, clip(item["title"], 24), 13, "bold", C["mode"]).pack(side="left")
+        self.label(head, item["at"], 12, color=C["sub"], mono=True).pack(side="right")
+        self.label(
+            box, item["text"], 13, wraplength=296, justify="left", anchor="w", width=298,
+        ).pack(fill="x", padx=16, pady=(6, 10))
+        buttons = ctk.CTkFrame(box, fg_color=C["card"])
+        buttons.pack(fill="x", padx=16, pady=(0, 14))
+        self.button(buttons, "확인", lambda: self.close_popup(win), primary=True, width=70).pack(side="right")
+        if can_snooze and item["title"] != "미리 보기":
+            def snooze():
+                self.app.snooze(item)
+                self.close_popup(win)
+
+            self.button(buttons, f"{SNOOZE_MIN}분 뒤 다시", snooze, width=96).pack(side="right", padx=(0, 6))
+        if auto_close:
+            self.label(buttons, f"{auto_close}초 뒤 닫혀요", 11, color=C["dim"]).pack(side="left")
+            win.after(auto_close * 1000, lambda: self.close_popup(win))
+        win.update_idletasks()
+        # 포커스를 빼앗지 않게 (입력 중이던 창이 그대로 활성으로 남는다), 작업 표시줄에도 안 보이게
+        try:
+            hwnd = int(win.wm_frame(), 16)
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
+            ctypes.windll.user32.SetWindowLongW(hwnd, -20, style | 0x08000000 | 0x80)  # NOACTIVATE | TOOLWINDOW
+        except (ValueError, OSError):
+            pass
+        self.popups.append(win)
+        self.place_popups()
+        win.deiconify()
+
+    def close_popup(self, win):
+        if win in getattr(self, "popups", []):
+            self.popups.remove(win)
+            win.destroy()
+            self.place_popups()
+
+    def place_popups(self):
+        left, top, right, bottom = self.work_area()
+        if self.widget_shown and self.widget.winfo_viewable():
+            # 미니 위젯이 오른쪽 아래에 있으면 그 위로 올린다
+            if self.widget.winfo_x() > (left + right) / 2 and self.widget.winfo_y() > (top + bottom) / 2:
+                bottom = self.widget.winfo_y() - 4
+        y = bottom - 10
+        for win in reversed(self.popups):  # 최근 것이 맨 아래
+            win.update_idletasks()
+            width, height = win.winfo_reqwidth(), win.winfo_reqheight()
+            y -= height
+            win.geometry(f"+{int(right - width - 12)}+{int(y)}")
+            y -= 8
 
     def on_slide(self, key, value, value_label, fmt):
         self.voice_values[key] = int(round(value))
@@ -2917,6 +3424,22 @@ class MainWindow:
                 check.select()
             self.widget_checks[key] = check
 
+        day = self.card(page)
+        day.pack(fill="x", pady=(12, 0))
+        text = ctk.CTkFrame(day, fg_color="transparent")
+        text.pack(side="left", padx=18, pady=16)
+        self.label(text, "하루 시작 시각", 14, "bold").pack(anchor="w")
+        self.label(
+            text, "이 시각 전에는 아직 전날로 봐요. 오늘 일정 브리핑은 이 시각 뒤 처음 켤 때 나와요.",
+            12, color=C["sub"],
+        ).pack(anchor="w")
+        self.day_start_menu = ctk.CTkOptionMenu(
+            day, values=[day_start_text(h) for h in range(13)], width=120,
+            command=self.set_day_start, **self.dropdown_style()
+        )
+        self.day_start_menu.set(day_start_text(self.app.store["day_start"]))
+        self.day_start_menu.pack(side="right", padx=18)
+
         data = self.card(page)
         data.pack(fill="x", pady=(12, 0))
         info = ctk.CTkFrame(data, fg_color="transparent")
@@ -2932,6 +3455,11 @@ class MainWindow:
         self.settings_msg.pack(anchor="w", pady=(10, 0))
         self.label(page, f"{APP_NAME} ({APP_NAME_EN}) v{APP_VERSION}", 12, color=C["dim"]).pack(side="bottom", anchor="w")
         return page
+
+    def set_day_start(self, choice):
+        hours = next(h for h in range(13) if day_start_text(h) == choice)
+        self.app.update_store(lambda s: s.__setitem__("day_start", hours))
+        self.flash(self.settings_msg, f"하루가 {choice}에 시작돼요.")
 
     def toggle_widget_item(self, key):
         checked = bool(self.widget_checks[key].get())
@@ -3139,6 +3667,7 @@ class MainWindow:
             self.editing_id = None
             self.update_form_mode(None)
         self.render_alarms()
+        self.render_timers()
         self.render_games()
         self.render_calendar()
         if self.day_dialog and self.day_dialog.winfo_exists():
@@ -3431,6 +3960,9 @@ class MainWindow:
             if request == "quit":
                 self.root.destroy()
                 return
+            if isinstance(request, tuple) and request[0] == "popup":
+                self.show_popup(request[1])
+                continue
             if request == "show":
                 self.root.deiconify()
                 self.root.lift()
@@ -3447,6 +3979,7 @@ class MainWindow:
             self.cal_today = datetime.date.today()  # 자정이 지나면 '오늘' 표시를 옮긴다
             self.render_calendar()
         self.update_status()
+        self.update_timers()
         self.root.after(500, self.poll)
 
     def run(self):
