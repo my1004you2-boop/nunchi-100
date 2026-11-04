@@ -1,4 +1,4 @@
-"""회화앱 연동 부분 테스트. 실행: python -m pytest tests"""
+"""수다백단 연동 부분 테스트. 실행: python -m pytest tests"""
 
 import datetime
 import importlib.machinery
@@ -16,7 +16,7 @@ DAY = datetime.date(2026, 11, 4)
 
 
 def make_hoehwa(tmp_path, goal=None, seconds=None):
-    folder = tmp_path / "회화앱"
+    folder = tmp_path / "수다백단"
     (folder / "talk").mkdir(parents=True)
     (folder / "main.pyw").write_text("", encoding="utf-8")
     if goal is not None:
@@ -60,4 +60,4 @@ def test_store_defaults(tmp_path, monkeypatch):
     monkeypatch.setattr(ta, "STORE_PATH", tmp_path / "alarms.json")
     store = ta.load_store()
     assert store["english"] == {"path": None, "time": "21:00", "fired_on": None}
-    assert store["alert_modes"]["english"] == "both"  # 팝업의 [회화앱 열기]를 쓸 수 있게
+    assert store["alert_modes"]["english"] == "both"  # 팝업의 [수다백단 열기]를 쓸 수 있게

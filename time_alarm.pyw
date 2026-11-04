@@ -25,7 +25,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "눈치백단타이머"
 APP_NAME_EN = "Nunchi 100"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 
 BASE_DIR = Path(__file__).resolve().parent
 STORE_PATH = BASE_DIR / "alarms.json"
@@ -100,8 +100,8 @@ ALERT_KINDS = {
 ALERT_MODES = {"voice": "음성", "popup": "팝업", "both": "둘 다"}
 SNOOZE_MIN = 5
 
-# 회화앱(별도 영어 회화 트레이닝 프로그램) 연동: 설정에서 폴더를 고르면 켜진다. 회화앱 파일은 읽기만 한다
-# path: 회화앱 폴더, time: 매일 알릴 시각, fired_on: 마지막으로 알린 날짜
+# 수다백단(Suda 100, 별도 영어 회화 프로그램) 연동: 설정에서 폴더를 고르면 켜진다. 수다백단 파일은 읽기만 한다
+# path: 수다백단 폴더, time: 매일 알릴 시각, fired_on: 마지막으로 알린 날짜
 DEFAULT_ENGLISH = {"path": None, "time": "21:00", "fired_on": None}
 ENGLISH_DEFAULT_GOAL = 20
 ENGLISH_TIMES = [f"{h:02d}:{m:02d}" for h in range(6, 24) for m in (0, 30)]
@@ -201,7 +201,7 @@ def load_store():
         # 알림 종류별 방식: voice / popup / both (처음엔 모두 음성)
         "alert_modes": {
             **{kind: "voice" for kind in ALERT_KINDS},
-            "english": "both",  # 팝업의 [회화앱 열기]로 바로 시작할 수 있게
+            "english": "both",  # 팝업의 [수다백단 열기]로 바로 시작할 수 있게
             **{k: v for k, v in data.get("alert_modes", {}).items() if k in ALERT_KINDS and v in ALERT_MODES},
         },
         # 멀티 타이머 목록: [{"id", "name", "seconds"}] (돌고 있는 상태는 저장하지 않는다)
@@ -245,9 +245,9 @@ def save_records(records):
     os.replace(tmp, RECORDS_PATH)
 
 
-# ----- 회화앱 연동 -----
+# ----- 수다백단 연동 -----
 def english_dir(path):
-    """고른 폴더가 회화앱이면 Path, 아니면 None."""
+    """고른 폴더가 수다백단이면 Path, 아니면 None."""
     if not path:
         return None
     folder = Path(path)
@@ -255,7 +255,7 @@ def english_dir(path):
 
 
 def english_progress(folder, day):
-    """(오늘 영어 대화한 분, 하루 목표 분). 회화앱 설정 파일에서는 목표만 읽는다."""
+    """(오늘 영어 대화한 분, 하루 목표 분). 수다백단 설정 파일에서는 목표만 읽는다."""
     try:
         goal = int(json.loads((folder / "settings.json").read_text(encoding="utf-8"))["daily_goal_min"])
     except (OSError, ValueError, TypeError, KeyError):
@@ -283,7 +283,7 @@ def english_due(cfg, now):
 
 
 def launch_english(folder):
-    """회화앱을 콘솔 창 없이 켠다. 이미 켜져 있으면 회화앱이 기존 창을 앞으로 가져온다."""
+    """수다백단을 콘솔 창 없이 켠다. 이미 켜져 있으면 수다백단이 기존 창을 앞으로 가져온다."""
     exe = Path(sys.executable)
     pythonw = exe.with_name("pythonw.exe")
     subprocess.Popen(
@@ -1003,7 +1003,7 @@ class TimeAlarm:
                     lambda _: "재개" if self.paused else "일시정지", self.on_toggle_pause
                 ),
                 pystray.MenuItem("사이클 처음부터", self.on_restart),
-                pystray.MenuItem("회화앱 열기", self.on_english, visible=lambda _: self.english_folder() is not None),
+                pystray.MenuItem("수다백단 열기", self.on_english, visible=lambda _: self.english_folder() is not None),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("종료", self.on_quit),
             ),
@@ -1579,7 +1579,7 @@ class TimeAlarm:
             try:
                 launch_english(folder)
             except OSError:
-                self.say("회화앱을 열지 못했습니다.")
+                self.say("수다백단을 열지 못했습니다.")
 
     def on_quit(self, *_):
         self.ui_requests.put("quit")
@@ -3282,7 +3282,7 @@ class MainWindow:
                 self.app.on_english()
                 self.close_popup(win)
 
-            self.button(buttons, "회화앱 열기", open_english, width=96).pack(side="right", padx=(0, 6))
+            self.button(buttons, "수다백단 열기", open_english, width=96).pack(side="right", padx=(0, 6))
         if can_snooze and item["title"] != "미리 보기":
             def snooze():
                 self.app.snooze(item)
@@ -3555,7 +3555,7 @@ class MainWindow:
         self.label(page, f"{APP_NAME} ({APP_NAME_EN}) v{APP_VERSION}", 12, color=C["dim"]).pack(side="bottom", anchor="w")
         return page
 
-    # ----- 회화앱 연동 -----
+    # ----- 수다백단 연동 -----
     def render_english_card(self):
         for child in self.english_card.winfo_children():
             child.destroy()
@@ -3564,10 +3564,10 @@ class MainWindow:
             at = self.app.store["english"]["time"]
         text = ctk.CTkFrame(self.english_card, fg_color="transparent")
         text.pack(side="left", fill="x", expand=True, padx=18, pady=16)
-        self.label(text, "회화앱 연동", 14, "bold").pack(anchor="w")
+        self.label(text, "수다백단 연동", 14, "bold").pack(anchor="w")
         if folder is None:
             self.label(
-                text, "영어 회화 트레이닝 앱(회화앱) 폴더를 고르면 매일 영어 시간을 알려 주고 트레이 메뉴에서 바로 열 수 있어요.",
+                text, "영어 회화 앱 수다백단(Suda 100)의 폴더를 고르면 매일 영어 시간을 알려 주고 트레이 메뉴에서 바로 열 수 있어요.",
                 12, color=C["sub"], wraplength=440, justify="left",
             ).pack(anchor="w")
             self.button(self.english_card, "폴더 선택", self.choose_english, width=90).pack(side="right", padx=18)
@@ -3584,18 +3584,18 @@ class MainWindow:
         menu.pack(side="right", padx=(0, 8))
 
     def choose_english(self):
-        path = filedialog.askdirectory(title="회화앱 폴더를 골라 주세요")
+        path = filedialog.askdirectory(title="수다백단 폴더를 골라 주세요")
         if not path:
             return
         if english_dir(path) is None:
-            self.flash(self.settings_msg, "회화앱 폴더가 아니에요. main.pyw가 들어 있는 폴더를 골라 주세요.", C["warn"])
+            self.flash(self.settings_msg, "수다백단 폴더가 아니에요. main.pyw가 들어 있는 폴더를 골라 주세요.", C["warn"])
             return
         self.app.update_store(lambda s: s["english"].__setitem__("path", path))
-        self.english_changed("회화앱과 연결했어요.")
+        self.english_changed("수다백단과 연결했어요.")
 
     def disconnect_english(self):
         self.app.update_store(lambda s: s["english"].__setitem__("path", None))
-        self.english_changed("회화앱 연결을 해제했어요.")
+        self.english_changed("수다백단 연결을 해제했어요.")
 
     def set_english_time(self, choice):
         self.app.update_store(lambda s: s["english"].update(time=choice, fired_on=None))
