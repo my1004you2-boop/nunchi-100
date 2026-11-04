@@ -25,7 +25,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "눈치백단타이머"
 APP_NAME_EN = "Nunchi 100"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 
 BASE_DIR = Path(__file__).resolve().parent
 STORE_PATH = BASE_DIR / "alarms.json"
@@ -95,9 +95,16 @@ ALERT_KINDS = {
     "event": ("캘린더 일정", None, True),
     "brief": ("오늘 일정 브리핑", 15, False),
     "timer": ("타이머", None, True),
+    "english": ("영어 회화 알림", None, True),
 }
 ALERT_MODES = {"voice": "음성", "popup": "팝업", "both": "둘 다"}
 SNOOZE_MIN = 5
+
+# 회화앱(별도 영어 회화 트레이닝 프로그램) 연동: 설정에서 폴더를 고르면 켜진다. 회화앱 파일은 읽기만 한다
+# path: 회화앱 폴더, time: 매일 알릴 시각, fired_on: 마지막으로 알린 날짜
+DEFAULT_ENGLISH = {"path": None, "time": "21:00", "fired_on": None}
+ENGLISH_DEFAULT_GOAL = 20
+ENGLISH_TIMES = [f"{h:02d}:{m:02d}" for h in range(6, 24) for m in (0, 30)]
 DEFAULT_DAY_START = 5  # 이 시각 전에 켜면 아직 전날로 본다 (새벽 작업 중에 다음 날 브리핑이 나가지 않게)
 
 # 캘린더 일정 알림: 기본으로 몇 분 전부터 알릴지, 고를 수 있는 시작 전 시간과 간격(분)
@@ -194,6 +201,7 @@ def load_store():
         # 알림 종류별 방식: voice / popup / both (처음엔 모두 음성)
         "alert_modes": {
             **{kind: "voice" for kind in ALERT_KINDS},
+            "english": "both",  # 팝업의 [회화앱 열기]로 바로 시작할 수 있게
             **{k: v for k, v in data.get("alert_modes", {}).items() if k in ALERT_KINDS and v in ALERT_MODES},
         },
         # 멀티 타이머 목록: [{"id", "name", "seconds"}] (돌고 있는 상태는 저장하지 않는다)
@@ -201,6 +209,7 @@ def load_store():
         "briefing": data.get("briefing", True),  # PC를 켤 때 오늘 일정 브리핑
         "briefed_on": data.get("briefed_on"),  # 마지막으로 브리핑한 날짜
         "day_start": data.get("day_start", DEFAULT_DAY_START),  # 하루가 시작되는 시각 (0~12시)
+        "english": {**DEFAULT_ENGLISH, **data.get("english", {})},
         # 작업 표시줄 위 미니 위젯: 켜짐 여부, 사용자가 옮긴 위치 [x, y] (없으면 오른쪽 아래), 보여 줄 항목
         "widget": {
             "enabled": True,
@@ -234,6 +243,53 @@ def save_records(records):
     tmp = RECORDS_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(records, ensure_ascii=False, indent=1), encoding="utf-8")
     os.replace(tmp, RECORDS_PATH)
+
+
+# ----- 회화앱 연동 -----
+def english_dir(path):
+    """고른 폴더가 회화앱이면 Path, 아니면 None."""
+    if not path:
+        return None
+    folder = Path(path)
+    return folder if (folder / "main.pyw").is_file() and (folder / "talk").is_dir() else None
+
+
+def english_progress(folder, day):
+    """(오늘 영어 대화한 분, 하루 목표 분). 회화앱 설정 파일에서는 목표만 읽는다."""
+    try:
+        goal = int(json.loads((folder / "settings.json").read_text(encoding="utf-8"))["daily_goal_min"])
+    except (OSError, ValueError, TypeError, KeyError):
+        goal = ENGLISH_DEFAULT_GOAL
+    try:
+        daily = json.loads((folder / "data" / "daily" / f"{day.isoformat()}.json").read_text(encoding="utf-8"))
+        seconds = int(daily["seconds"])
+    except (OSError, ValueError, TypeError, KeyError):
+        seconds = 0
+    return seconds // 60, goal
+
+
+def english_message(done, goal):
+    """알릴 문구. 오늘 목표를 이미 채웠으면 None (조용히 넘어간다)."""
+    if done >= goal:
+        return None
+    if done == 0:
+        return "영어 회화 시간이에요. 오늘도 가볍게 이야기해 볼까요?"
+    return f"오늘 영어 회화 {done}분 했어요. {goal - done}분 남았어요."
+
+
+def english_due(cfg, now):
+    """오늘 아직 안 알렸고 알릴 시각이 지났으면 True. 늦게 켜도 그날 한 번은 알린다."""
+    return cfg["fired_on"] != now.date().isoformat() and now.strftime("%H:%M") >= cfg["time"]
+
+
+def launch_english(folder):
+    """회화앱을 콘솔 창 없이 켠다. 이미 켜져 있으면 회화앱이 기존 창을 앞으로 가져온다."""
+    exe = Path(sys.executable)
+    pythonw = exe.with_name("pythonw.exe")
+    subprocess.Popen(
+        [str(pythonw if pythonw.exists() else exe), str(folder / "main.pyw")],
+        cwd=folder, creationflags=subprocess.CREATE_NO_WINDOW,
+    )
 
 
 def parse_ts(text):
@@ -947,6 +1003,7 @@ class TimeAlarm:
                     lambda _: "재개" if self.paused else "일시정지", self.on_toggle_pause
                 ),
                 pystray.MenuItem("사이클 처음부터", self.on_restart),
+                pystray.MenuItem("회화앱 열기", self.on_english, visible=lambda _: self.english_folder() is not None),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("종료", self.on_quit),
             ),
@@ -1234,6 +1291,7 @@ class TimeAlarm:
             self.check_timers()
             self.check_snoozes()
             self.check_events()
+            self.check_english()
 
             locked = is_locked()
             unlocked = was_locked and not locked
@@ -1406,6 +1464,25 @@ class TimeAlarm:
             text += " 진행 중인 일정: " + ", ".join(items) + "."
         self.notify(text, "brief")
 
+    def english_folder(self):
+        with self.lock:
+            return english_dir(self.store["english"]["path"])
+
+    def check_english(self):
+        """정한 시각에 영어 회화를 권한다. 게임 중·일시정지·잠금이면 끝날 때까지 기다렸다가 알린다."""
+        folder = self.english_folder()
+        if folder is None:
+            return
+        now = datetime.datetime.now()
+        with self.lock:
+            due = english_due(self.store["english"], now)
+        if not due or self.gaming or self.paused or is_locked():
+            return
+        self.update_store(lambda s: s["english"].__setitem__("fired_on", now.date().isoformat()))
+        text = english_message(*english_progress(folder, now.date()))
+        if text:
+            self.notify(text, "english")
+
     def update_gaming(self):
         with self.lock:
             games = list(self.store["games"])
@@ -1495,6 +1572,14 @@ class TimeAlarm:
 
     def on_restart(self, *_):
         self.restart_cycle()
+
+    def on_english(self, *_):
+        folder = self.english_folder()
+        if folder:
+            try:
+                launch_english(folder)
+            except OSError:
+                self.say("회화앱을 열지 못했습니다.")
 
     def on_quit(self, *_):
         self.ui_requests.put("quit")
@@ -3045,6 +3130,7 @@ class MainWindow:
         self.mode_buttons = {}
         with self.app.lock:
             current = dict(self.app.store["alert_modes"])
+        self.english_mode_row = None
         for row, (kind, (name, auto_close, _)) in enumerate(ALERT_KINDS.items()):
             label = ctk.CTkFrame(rows, fg_color="transparent")
             label.grid(row=row, column=0, sticky="w", pady=4)
@@ -3060,6 +3146,9 @@ class MainWindow:
             seg.set(ALERT_MODES[current[kind]])
             seg.grid(row=row, column=1, sticky="e", pady=4)
             self.mode_buttons[kind] = seg
+            if kind == "english":
+                self.english_mode_row = (label, seg)
+        self.update_english_rows()
 
         self.label(page, "목소리", 14, "bold").pack(anchor="w", pady=(18, 0))
         box = self.card(page)
@@ -3188,6 +3277,12 @@ class MainWindow:
         buttons = ctk.CTkFrame(box, fg_color=C["card"])
         buttons.pack(fill="x", padx=16, pady=(0, 14))
         self.button(buttons, "확인", lambda: self.close_popup(win), primary=True, width=70).pack(side="right")
+        if item["kind"] == "english" and self.app.english_folder():
+            def open_english():
+                self.app.on_english()
+                self.close_popup(win)
+
+            self.button(buttons, "회화앱 열기", open_english, width=96).pack(side="right", padx=(0, 6))
         if can_snooze and item["title"] != "미리 보기":
             def snooze():
                 self.app.snooze(item)
@@ -3440,6 +3535,10 @@ class MainWindow:
         self.day_start_menu.set(day_start_text(self.app.store["day_start"]))
         self.day_start_menu.pack(side="right", padx=18)
 
+        self.english_card = self.card(page)
+        self.english_card.pack(fill="x", pady=(12, 0))
+        self.render_english_card()
+
         data = self.card(page)
         data.pack(fill="x", pady=(12, 0))
         info = ctk.CTkFrame(data, fg_color="transparent")
@@ -3455,6 +3554,67 @@ class MainWindow:
         self.settings_msg.pack(anchor="w", pady=(10, 0))
         self.label(page, f"{APP_NAME} ({APP_NAME_EN}) v{APP_VERSION}", 12, color=C["dim"]).pack(side="bottom", anchor="w")
         return page
+
+    # ----- 회화앱 연동 -----
+    def render_english_card(self):
+        for child in self.english_card.winfo_children():
+            child.destroy()
+        folder = self.app.english_folder()
+        with self.app.lock:
+            at = self.app.store["english"]["time"]
+        text = ctk.CTkFrame(self.english_card, fg_color="transparent")
+        text.pack(side="left", fill="x", expand=True, padx=18, pady=16)
+        self.label(text, "회화앱 연동", 14, "bold").pack(anchor="w")
+        if folder is None:
+            self.label(
+                text, "영어 회화 트레이닝 앱(회화앱) 폴더를 고르면 매일 영어 시간을 알려 주고 트레이 메뉴에서 바로 열 수 있어요.",
+                12, color=C["sub"], wraplength=440, justify="left",
+            ).pack(anchor="w")
+            self.button(self.english_card, "폴더 선택", self.choose_english, width=90).pack(side="right", padx=18)
+            return
+        self.label(
+            text, f"매일 {at}에 알려요. 오늘 목표를 채웠으면 조용히 넘어가요.", 12, color=C["sub"]
+        ).pack(anchor="w")
+        self.label(text, str(folder), 11, color=C["dim"]).pack(anchor="w")
+        self.button(self.english_card, "연결 해제", self.disconnect_english, width=84).pack(side="right", padx=(0, 18))
+        menu = ctk.CTkOptionMenu(
+            self.english_card, values=ENGLISH_TIMES, width=90, command=self.set_english_time, **self.dropdown_style()
+        )
+        menu.set(at)
+        menu.pack(side="right", padx=(0, 8))
+
+    def choose_english(self):
+        path = filedialog.askdirectory(title="회화앱 폴더를 골라 주세요")
+        if not path:
+            return
+        if english_dir(path) is None:
+            self.flash(self.settings_msg, "회화앱 폴더가 아니에요. main.pyw가 들어 있는 폴더를 골라 주세요.", C["warn"])
+            return
+        self.app.update_store(lambda s: s["english"].__setitem__("path", path))
+        self.english_changed("회화앱과 연결했어요.")
+
+    def disconnect_english(self):
+        self.app.update_store(lambda s: s["english"].__setitem__("path", None))
+        self.english_changed("회화앱 연결을 해제했어요.")
+
+    def set_english_time(self, choice):
+        self.app.update_store(lambda s: s["english"].update(time=choice, fired_on=None))
+        self.english_changed(f"매일 {choice}에 영어 회화를 알려요.")
+
+    def english_changed(self, message):
+        self.render_english_card()
+        self.update_english_rows()
+        self.app.icon.update_menu()
+        self.flash(self.settings_msg, message)
+
+    def update_english_rows(self):
+        if not getattr(self, "english_mode_row", None):
+            return
+        for widget in self.english_mode_row:
+            if self.app.english_folder():
+                widget.grid()
+            else:
+                widget.grid_remove()
 
     def set_day_start(self, choice):
         hours = next(h for h in range(13) if day_start_text(h) == choice)
