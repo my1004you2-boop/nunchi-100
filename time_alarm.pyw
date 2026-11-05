@@ -25,7 +25,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "눈치백단타이머"
 APP_NAME_EN = "Nunchi 100"
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.8.0"
 
 BASE_DIR = Path(__file__).resolve().parent
 STORE_PATH = BASE_DIR / "alarms.json"
@@ -686,6 +686,11 @@ def is_period(event):
     return event_end(event) > event_start(event)
 
 
+def is_daily(event):
+    """기간 일정 중 '매일 알림'을 켠 것: 기간 안의 날마다 같은 시각 기준으로 알린다."""
+    return is_period(event) and bool(event.get("daily"))
+
+
 # ----- 반복 일정 -----
 NTH = ["첫째", "둘째", "셋째", "넷째", "다섯째"]
 
@@ -746,8 +751,8 @@ def occurs_on(event, day):
 
 
 def next_event_time(event, now):
-    """지금 이후 이 일정이 처음 시작하는 시각 (반복이면 1년 안에서 찾는다)."""
-    if not is_recurring(event):
+    """지금 이후 이 일정이 처음 시작하는 시각 (반복·매일 알림이면 1년 안에서 찾는다)."""
+    if not (is_recurring(event) or is_daily(event)):
         at = event_dt(event)
         return at if at > now else None
     hh, mm = map(int, event["time"].split(":"))
@@ -853,7 +858,7 @@ def describe_alerts(event):
     if interval == 0:
         return "알림 없음"
     text = f"{fmt_left(lead)} 전" if interval < 0 else f"{fmt_left(lead)} 전부터 {fmt_left(interval)}마다"
-    return text + (" + 시작" if at_start else "")
+    return ("매일 " if is_daily(event) else "") + text + (" + 시작" if at_start else "")
 
 
 @functools.lru_cache(maxsize=16)
@@ -1079,7 +1084,7 @@ class TimeAlarm:
             events = [dict(e) for e in self.store["events"] if occurs_on(e, today)]
         upcoming = [
             e for e in events
-            if not is_period(e) and datetime.datetime.combine(today, event_dt(e).time()) > now
+            if (not is_period(e) or is_daily(e)) and datetime.datetime.combine(today, event_dt(e).time()) > now
         ]
         return len(events), len(upcoming)
 
@@ -1351,7 +1356,7 @@ class TimeAlarm:
             events = [dict(e) for e in self.store["events"]]
         today = now.date()
         for event in events:
-            if is_recurring(event):
+            if is_recurring(event) or is_daily(event):
                 # 시작 전 알림이 며칠 앞에 걸칠 수 있어서 그만큼 앞의 회차까지 본다
                 ahead = event_alert_settings(event)[0] // 1440 + 1
                 days = [
@@ -1460,7 +1465,8 @@ class TimeAlarm:
             items = []
             for e in ongoing:
                 left = (event_end(e) - today).days
-                items.append(f"{e['title']}, " + ("오늘 마감" if left == 0 else f"{left}일 남음"))
+                daily = f"오늘 {korean_time(datetime.datetime.combine(today, event_dt(e).time()))}, " if is_daily(e) else ""
+                items.append(f"{e['title']}, {daily}" + ("오늘 마감" if left == 0 else f"{left}일 남음"))
             text += " 진행 중인 일정: " + ", ".join(items) + "."
         self.notify(text, "brief")
 
@@ -2692,6 +2698,13 @@ class MainWindow:
         self.label(dates, "~", 14, color=C["sub"]).pack(side="left", padx=(0, 6))
         self.ev_end = self.entry(dates, 118)
         self.ev_end.pack(side="left")
+        self.ev_daily = ctk.CTkCheckBox(
+            dates, text="매일 알림", command=self.update_alert_preview, width=60, font=self.font(12),
+            text_color=C["fg"], fg_color=C["accent"], hover_color=C["accent_hover"], border_color=C["line_hl"],
+            text_color_disabled=C["dim"], checkbox_width=20, checkbox_height=20,
+        )
+        self.ev_daily.pack(side="left", padx=(12, 0))
+        self.ev_end.bind("<KeyRelease>", lambda _e: self.update_alert_preview())
         self.ev_start.bind("<FocusOut>", lambda _e: self.update_repeat_options())
         self.ev_start.bind("<Return>", lambda _e: self.update_repeat_options())
 
@@ -2803,6 +2816,10 @@ class MainWindow:
             self.ev_repeat.set("반복 안 함")  # 기간 일정은 반복할 수 없다
             self.on_repeat_change()
         self.ev_end.configure(state="normal" if on else "disabled", text_color=C["fg"] if on else C["dim"])
+        if not on:
+            self.ev_daily.deselect()
+        self.ev_daily.configure(state="normal" if on else "disabled")
+        self.update_alert_preview()
         if on:
             try:
                 start = datetime.date.fromisoformat(self.ev_start.get().strip())
@@ -2868,6 +2885,8 @@ class MainWindow:
         self.ev_end.configure(state="normal")
         self.set_entry(self.ev_end, (self.day_date + datetime.timedelta(days=1)).isoformat())
         self.ev_end.configure(state="disabled", text_color=C["dim"])
+        self.ev_daily.deselect()
+        self.ev_daily.configure(state="disabled")
         self.ev_color_touched = False
         self.pick_color("purple")
         self.update_repeat_options("none")
@@ -2893,7 +2912,11 @@ class MainWindow:
         if is_period(event):
             self.ev_period.select()
             self.set_entry(self.ev_end, event["end_date"])
+            self.ev_daily.configure(state="normal")
+            self.ev_daily.select() if is_daily(event) else self.ev_daily.deselect()
         else:
+            self.ev_daily.deselect()
+            self.ev_daily.configure(state="disabled")
             self.ev_period.deselect()
             self.set_entry(self.ev_end, (event_start(event) + datetime.timedelta(days=1)).isoformat())
             self.ev_end.configure(state="disabled", text_color=C["dim"])
@@ -2962,6 +2985,8 @@ class MainWindow:
         }
         if end > start:
             fields["end_date"] = end.isoformat()
+            if self.ev_daily.get():
+                fields["daily"] = True
         if repeat != "none":
             fields["repeat"] = {"type": repeat, "until": until.isoformat() if until else None}
         event_id = self.event_editing
@@ -2970,6 +2995,7 @@ class MainWindow:
                 for event in store["events"]:
                     if event["id"] == event_id:
                         event.pop("end_date", None)
+                        event.pop("daily", None)
                         event.pop("repeat", None)
                         event.update(fields)
 
@@ -2983,6 +3009,8 @@ class MainWindow:
             done = "추가했어요."
         if repeat != "none":
             done += f" ({repeat_label(fields)})"
+        elif is_daily(fields):
+            done += f" ({end.month}/{end.day}까지 매일 {fields['time']} 기준으로 알려요)"
         elif event_dt(fields) <= datetime.datetime.now():
             done += " 시작 시각이 지나서 알림은 울리지 않아요."
         self.clear_event_form()
@@ -3035,7 +3063,16 @@ class MainWindow:
         stamps = [stamp(left) for left in offsets]
         if len(stamps) > 7:
             stamps = stamps[:3] + ["…"] + stamps[-2:]
-        self.ev_preview.configure(text=f"→ {' · '.join(stamps)}  (총 {len(offsets)}번)", text_color=C["mode"])
+        if self.ev_period.get() and self.ev_daily.get():
+            try:
+                end = datetime.date.fromisoformat(self.ev_end.get().strip())
+                days = f", {(end - self.current_start()).days + 1}일 동안"
+            except ValueError:
+                days = ""
+            text = f"→ 매일 {' · '.join(stamps)}  (하루 {len(offsets)}번{days})"
+        else:
+            text = f"→ {' · '.join(stamps)}  (총 {len(offsets)}번)"
+        self.ev_preview.configure(text=text, text_color=C["mode"])
 
     def ask_delete(self, event):
         """반복 일정이면 '이 날만'과 '반복 전체' 중에서 고르게 한다."""
