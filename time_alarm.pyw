@@ -25,7 +25,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "눈치백단타이머"
 APP_NAME_EN = "Nunchi 100"
-APP_VERSION = "1.10.1"
+APP_VERSION = "1.11.0"
 
 BASE_DIR = Path(__file__).resolve().parent
 STORE_PATH = BASE_DIR / "alarms.json"
@@ -106,8 +106,21 @@ SNOOZE_MIN = 5
 DEFAULT_ENGLISH = {"path": None, "time": "21:00", "fired_on": None, "goals": {}}
 ENGLISH_DEFAULT_GOAL = 20
 ENGLISH_MIN_MODES = 2  # 회화 완료 기준: 하루 목표 시간 이상 + 서로 다른 모드 2개 이상
-# 달력 칸의 회화 배지 색: 완료 초록, 미완료 빨강, 오늘 진행 중 노랑, 안 함 회색
-ENGLISH_COLORS = {"done": "#40C057", "miss": "#FA5252", "today": "#FCC419", "none": "#5C6380"}
+# 달력 칸의 회화 배지 색 (테마별): 완료 초록, 미완료 빨강, 오늘 진행 중 노랑·주황, 안 함 회색
+ENGLISH_THEME_COLORS = {
+    "light": {"done": "#2E9E6B", "miss": "#D9534F", "today": "#F4A261", "none": "#B4AFCC"},
+    "dark": {"done": "#40C057", "miss": "#FA5252", "today": "#FCC419", "none": "#5C6380"},
+}
+ENGLISH_COLORS = {}
+
+
+def apply_theme(name):
+    """C와 회화 배지 색을 고른 테마로 채운다. 창을 만들기 전에 한 번 부른다."""
+    name = name if name in THEMES else "light"
+    C.clear()
+    C.update(THEMES[name])
+    ENGLISH_COLORS.clear()
+    ENGLISH_COLORS.update(ENGLISH_THEME_COLORS[name])
 ENGLISH_LEGEND = [("done", "완료"), ("miss", "미완료"), ("today", "오늘 진행 중"), ("none", "안 함")]
 ENGLISH_TIMES = [f"{h:02d}:{m:02d}" for h in range(6, 24) for m in (0, 30)]
 DEFAULT_DAY_START = 5  # 이 시각 전에 켜면 아직 전날로 본다 (새벽 작업 중에 다음 날 브리핑이 나가지 않게)
@@ -137,35 +150,99 @@ COLORS = {
     "paused": (140, 140, 140),
 }
 
-# 창 색 (다크 게이밍 테마)
-C = {
-    "bg": "#12141c",
-    "side": "#0d0f15",
-    "side_hover": "#171a24",
-    "card": "#1a1d29",
-    "card_hl": "#1d1934",
-    "input": "#11131a",
-    "btn": "#232738",
-    "btn_hover": "#2c3147",
-    "line": "#2a2f44",
-    "line_hl": "#3a3170",
-    "fg": "#e6e8f2",
-    "sub": "#8a8fab",
-    "dim": "#4a5070",
-    "accent": "#8b6cff",
-    "accent_hover": "#7a5cf0",
-    "accent_soft": "#2a2450",
-    "mode": "#b7a6ff",
-    "good": "#38d9a9",
-    "brk": "#4dabf7",
-    "warn": "#ff8787",
-    "track": "#262a3c",
-    "off": "#343a52",
-    "sel": "#1e1a38",
-    "game_bg": "#241d47",
-    "game_fg": "#c9bcff",
-    "game_icon": "#262046",
+# 창 색 테마. 앱을 켤 때 설정(alarms.json의 theme)에 따라 C를 채운다 (apply_theme)
+THEMES = {
+    # 라벤더 (기본, calendar-theme-colors.md 기준)
+    "light": {
+        "bg": "#FBFAFF",  # 앱 배경
+        "side": "#F3F1FC",  # 사이드바 배경
+        "side_hover": "#EAE7FA",
+        "card": "#FFFFFF",  # 카드·날짜 칸
+        "card_hl": "#F5F3FF",  # 강조 카드·오늘 칸
+        "card_other": "#F7F6FB",  # 다른 달 날짜 칸
+        "input": "#FBFAFF",
+        "btn": "#EFEDFD",  # 보조 버튼 ('오늘' 버튼 배경)
+        "btn_hover": "#E4E1F7",
+        "line": "#E4E1F7",  # 테두리
+        "line_hl": "#CFC8F5",
+        "fg": "#2A2640",  # 본문 텍스트
+        "sub": "#6B6585",  # 보조 텍스트
+        "dim": "#B4AFCC",  # 비활성 텍스트
+        "muted": "#8A85A3",  # 흐린 텍스트 (요일, 기준 문구)
+        "accent": "#6C5CE7",  # 메인
+        "accent_hover": "#5A4BD8",
+        "accent_soft": "#EFEDFD",  # 하이라이트 배경
+        "mode": "#4B3FC0",  # 메인 진한 톤 (강조 텍스트, 오늘 날짜, 타이머 숫자)
+        "good": "#2E9E6B",
+        "brk": "#4A7FC1",  # 휴식·토요일
+        "warn": "#D9534F",  # 경고·일요일
+        "track": "#ECE9FA",
+        "off": "#D6D2EA",
+        "sel": "#EFEDFD",
+        "game_bg": "#EFEDFD",
+        "game_fg": "#4B3FC0",
+        "game_icon": "#E6E2FB",
+        "game_wait": "#6B6585",
+        "nav_active": "#6C5CE7",  # 선택된 메뉴 바탕 (글자는 흰색)
+        "pill_bg": "#6C5CE7",  # 사이드바 [수다백단 ▶]
+        "pill_fg": "#FFFFFF",
+        "pill_hover": "#5A4BD8",
+        "seg_sel": "#CFC8F5",  # 선택형 버튼(음성/팝업/둘 다)의 선택칸
+        "seg_sel_hover": "#C3BAF2",
+        "swatch_sel": "#2A2640",  # 일정 색 고르기의 선택 테두리
+        "tree_sel_fg": "#4B3FC0",
+        "bar_ink": "#1C1830",  # 일정 막대 글자: 일정 색을 이 색과 섞는다
+        "bar_fill": 0.2,  # 일정 막대 바탕: 일정 색의 비율
+        "bar_text": 0.55,  # 일정 막대 글자: 일정 색의 비율
+        "appearance": "light",
+    },
+    # 다크 (예전 기본)
+    "dark": {
+        "bg": "#12141c",
+        "side": "#0d0f15",
+        "side_hover": "#171a24",
+        "card": "#1a1d29",
+        "card_hl": "#1d1934",
+        "card_other": "#12141c",
+        "input": "#11131a",
+        "btn": "#232738",
+        "btn_hover": "#2c3147",
+        "line": "#2a2f44",
+        "line_hl": "#3a3170",
+        "fg": "#e6e8f2",
+        "sub": "#8a8fab",
+        "dim": "#4a5070",
+        "muted": "#8a8fab",
+        "accent": "#8b6cff",
+        "accent_hover": "#7a5cf0",
+        "accent_soft": "#2a2450",
+        "mode": "#b7a6ff",
+        "good": "#38d9a9",
+        "brk": "#4dabf7",
+        "warn": "#ff8787",
+        "track": "#262a3c",
+        "off": "#343a52",
+        "sel": "#1e1a38",
+        "game_bg": "#241d47",
+        "game_fg": "#c9bcff",
+        "game_icon": "#262046",
+        "game_wait": "#a596e6",
+        "nav_active": "#2a2450",
+        "pill_bg": "#2a2450",
+        "pill_fg": "#b7a6ff",
+        "pill_hover": "#3a3170",
+        "seg_sel": "#8b6cff",
+        "seg_sel_hover": "#7a5cf0",
+        "swatch_sel": "#ffffff",
+        "tree_sel_fg": "#ffffff",
+        "bar_ink": "#ffffff",
+        "bar_fill": 0.32,
+        "bar_text": 0.5,
+        "appearance": "dark",
+    },
 }
+THEME_NAMES = {"light": "라벤더", "dark": "다크"}
+C = {}  # 지금 테마의 색 (apply_theme가 채운다)
 
 UI_FONT = "Malgun Gothic"
 MONO_FONT = "Consolas"
@@ -211,6 +288,7 @@ def load_store():
         },
         # 멀티 타이머 목록: [{"id", "name", "seconds"}] (돌고 있는 상태는 저장하지 않는다)
         "timers": data.get("timers", []),
+        "theme": data.get("theme") if data.get("theme") in THEMES else "light",  # 화면 테마
         "briefing": data.get("briefing", True),  # PC를 켤 때 오늘 일정 브리핑
         "briefed_on": data.get("briefed_on"),  # 마지막으로 브리핑한 날짜
         "day_start": data.get("day_start", DEFAULT_DAY_START),  # 하루가 시작되는 시각 (0~12시)
@@ -1130,6 +1208,7 @@ class TimeAlarm:
         self.first_run = not STORE_PATH.exists()  # 처음 실행이면 창을 바로 띄워 준다
         migrate_old_startup_link()
         self.store = load_store()
+        apply_theme(self.store["theme"])
         self.store_version = 0
         self.records = load_records()
         self.records_version = 0
@@ -1754,8 +1833,10 @@ class TimeAlarm:
     def run(self):
         threading.Thread(target=self.run_loop, daemon=True).start()
         self.icon.run_detached()
-        if self.first_run:
+        if self.first_run or "--settings" in sys.argv:
             self.ui_requests.put("show")
+        if "--settings" in sys.argv:
+            self.ui_requests.put(("page", "settings"))  # 테마를 바꾸고 다시 켜졌을 때
         try:
             MainWindow(self).run()
         finally:
@@ -1782,7 +1863,7 @@ class MainWindow:
         self.day_dialog = None
         self.event_editing = None
 
-        ctk.set_appearance_mode("dark")
+        ctk.set_appearance_mode(C["appearance"])
         self.root = ctk.CTk(fg_color=C["bg"])
         self.root.withdraw()
         self.root.title(f"{APP_NAME} ({APP_NAME_EN})")
@@ -1932,7 +2013,7 @@ class MainWindow:
         self.label(self.gamebar, "●", 12, color=C["accent"]).pack(side="left", padx=(16, 8))
         self.game_text = self.label(self.gamebar, "", 12, "bold", C["game_fg"])
         self.game_text.pack(side="left")
-        self.game_wait = self.label(self.gamebar, "", 12, color="#a596e6")
+        self.game_wait = self.label(self.gamebar, "", 12, color=C["game_wait"])
         self.game_wait.pack(side="right", padx=16)
         self.gamebar_shown = False
 
@@ -1946,7 +2027,7 @@ class MainWindow:
         self.label(sub, APP_NAME_EN, 11, "bold", C["mode"], mono=True).pack(side="left")
         self.side_english = ctk.CTkButton(
             sub, text="수다백단 ▶", width=72, height=22, corner_radius=11, font=self.font(11, "bold"),
-            fg_color=C["accent_soft"], hover_color=C["line_hl"], text_color=C["mode"],
+            fg_color=C["pill_bg"], hover_color=C["pill_hover"], text_color=C["pill_fg"],
             command=self.app.on_english,
         )
         self.update_side_english()
@@ -1997,7 +2078,7 @@ class MainWindow:
         for name, (btn, icons) in self.nav.items():
             active = name == key
             btn.configure(
-                fg_color=C["accent_soft"] if active else "transparent",
+                fg_color=C["nav_active"] if active else "transparent",
                 text_color="#ffffff" if active else C["sub"],
                 image=icons[1] if active else icons[0],
                 font=self.font(13, "bold" if active else "normal"),
@@ -2641,7 +2722,7 @@ class MainWindow:
             self.label(self.cal_english_legend, " " + name, 11, color=C["sub"], image=icon, compound="left").pack(
                 side="left", padx=(0, 12)
             )
-        self.cal_english_note = self.label(self.cal_english_legend, "", 11, color=C["dim"])
+        self.cal_english_note = self.label(self.cal_english_legend, "", 11, color=C["muted"])
         self.cal_english_note.pack(side="right")
         self.cal_english_stamp = None
         self.cal_canvas.bind("<Configure>", lambda _e: self.render_calendar())
@@ -2694,7 +2775,7 @@ class MainWindow:
         f_tiny = tkfont.Font(family=UI_FONT, size=-int(10 * s))
 
         for col, name in enumerate("일월화수목금토"):
-            color = C["warn"] if col == 0 else (C["brk"] if col == 6 else C["sub"])
+            color = C["warn"] if col == 0 else (C["brk"] if col == 6 else C["muted"])
             canvas.create_text(col_w * col + col_w / 2, head / 2, text=name, fill=color, font=f_head)
 
         lane_top, lane_h, lane_gap = 30 * s, 18 * s, 3 * s
@@ -2710,7 +2791,7 @@ class MainWindow:
                 is_today = day == today
                 round_rect(
                     canvas, x0 + 2 * s, y0 + 2 * s, x0 + col_w - 2 * s, y0 + row_h - 2 * s, 8 * s,
-                    fill=C["card"] if in_month else C["bg"],
+                    fill=C["card_hl"] if is_today else (C["card"] if in_month else C["card_other"]),
                     outline=C["accent"] if is_today else C["line"], width=2 if is_today else 1,
                 )
                 holiday = holiday_name(day)
@@ -2728,7 +2809,7 @@ class MainWindow:
                 if mark:
                     kind, note = mark
                     # 다른 달 칸은 흐리게
-                    mark_color = ENGLISH_COLORS[kind] if in_month else mix(ENGLISH_COLORS[kind], C["bg"], 0.4)
+                    mark_color = ENGLISH_COLORS[kind] if in_month else mix(ENGLISH_COLORS[kind], C["card_other"], 0.4)
                     r = 7 * s
                     bx, by = x0 + col_w - 9 * s - r, y0 + 7 * s + r
                     draw_english_badge(canvas, bx, by, r, kind, mark_color)
@@ -2779,7 +2860,7 @@ class MainWindow:
                 x2 = (c2 + 1) * col_w - (2 * s if cont_right else 6 * s)
                 y1 = y0 + lane_top + lane * (lane_h + lane_gap)
                 base = event_color(event)
-                round_rect(canvas, x1, y1, x2, y1 + lane_h, 4 * s, fill=mix(base, C["card"], 0.32), outline="")
+                round_rect(canvas, x1, y1, x2, y1 + lane_h, 4 * s, fill=mix(base, C["card"], C["bar_fill"]), outline="")
                 if cont_left:
                     text = "… " + event["title"]
                 elif is_period(event):
@@ -2788,7 +2869,7 @@ class MainWindow:
                     text = ("↻" if is_recurring(event) else "") + f"{event['time']} {event['title']}"
                 canvas.create_text(
                     x1 + 6 * s, y1 + lane_h / 2, anchor="w", font=f_bar,
-                    text=fit_text(f_bar, text, x2 - x1 - 10 * s), fill=mix(base, "#ffffff", 0.5),
+                    text=fit_text(f_bar, text, x2 - x1 - 10 * s), fill=mix(base, C["bar_ink"], C["bar_text"]),
                 )
             for col, count in enumerate(hidden):
                 if count:
@@ -2946,7 +3027,7 @@ class MainWindow:
         for key, color in EVENT_COLORS.items():
             swatch = ctk.CTkButton(
                 swatches, text="", width=26, height=26, corner_radius=13, fg_color=color, hover_color=color,
-                border_color="#ffffff", border_width=0, command=lambda k=key: self.pick_color(k, touched=True),
+                border_color=C["swatch_sel"], border_width=0, command=lambda k=key: self.pick_color(k, touched=True),
             )
             swatch.pack(side="left", padx=(0, 8))
             self.ev_swatches[key] = swatch
@@ -3403,7 +3484,7 @@ class MainWindow:
             self.label(label, hint, 11, color=C["dim"]).pack(side="left", padx=(8, 0))
             seg = ctk.CTkSegmentedButton(
                 rows, values=list(ALERT_MODES.values()), width=210, height=30, font=self.font(12),
-                fg_color=C["btn"], selected_color=C["accent"], selected_hover_color=C["accent_hover"],
+                fg_color=C["btn"], selected_color=C["seg_sel"], selected_hover_color=C["seg_sel_hover"],
                 unselected_color=C["btn"], unselected_hover_color=C["btn_hover"], text_color=C["fg"],
                 command=lambda value, k=kind: self.set_alert_mode(k, value),
             )
@@ -3733,11 +3814,35 @@ class MainWindow:
 
     # ----- 설정 화면 -----
     def build_settings_page(self, parent):
-        page = ctk.CTkFrame(parent, fg_color="transparent")
+        # 항목이 많아 작은 창에서도 다 보이도록 스크롤되게 한다
+        page = ctk.CTkScrollableFrame(
+            parent,
+            fg_color="transparent",
+            scrollbar_button_color=C["btn"],
+            scrollbar_button_hover_color=C["btn_hover"],
+        )
         self.page_header(page, "설정")
 
+        theme = self.card(page)
+        theme.pack(fill="x", pady=(14, 0), padx=(0, 8))
+        text = ctk.CTkFrame(theme, fg_color="transparent")
+        text.pack(side="left", padx=18, pady=16)
+        self.label(text, "화면 테마", 14, "bold").pack(anchor="w")
+        self.label(
+            text, "바꾸면 프로그램이 잠깐 다시 켜지면서 바로 적용돼요. 메인 알람은 그대로 이어져요.",
+            12, color=C["sub"], wraplength=400, justify="left",
+        ).pack(anchor="w")
+        self.theme_buttons = ctk.CTkSegmentedButton(
+            theme, values=list(THEME_NAMES.values()), width=150, height=32, font=self.font(12),
+            fg_color=C["btn"], selected_color=C["seg_sel"], selected_hover_color=C["seg_sel_hover"],
+            unselected_color=C["btn"], unselected_hover_color=C["btn_hover"], text_color=C["fg"],
+            command=self.set_theme,
+        )
+        self.theme_buttons.set(THEME_NAMES[self.app.store["theme"]])
+        self.theme_buttons.pack(side="right", padx=18)
+
         startup = self.card(page)
-        startup.pack(fill="x", pady=(14, 0))
+        startup.pack(fill="x", pady=(12, 0), padx=(0, 8))
         text = ctk.CTkFrame(startup, fg_color="transparent")
         text.pack(side="left", padx=18, pady=16)
         self.label(text, "PC 켜면 자동으로 실행", 14, "bold").pack(anchor="w")
@@ -3750,7 +3855,7 @@ class MainWindow:
             self.autostart_switch.select()
 
         mini = self.card(page)
-        mini.pack(fill="x", pady=(12, 0))
+        mini.pack(fill="x", pady=(12, 0), padx=(0, 8))
         top = ctk.CTkFrame(mini, fg_color="transparent")
         top.pack(fill="x", padx=18, pady=(16, 0))
         text = ctk.CTkFrame(top, fg_color="transparent")
@@ -3784,13 +3889,13 @@ class MainWindow:
             self.widget_checks[key] = check
 
         day = self.card(page)
-        day.pack(fill="x", pady=(12, 0))
+        day.pack(fill="x", pady=(12, 0), padx=(0, 8))
         text = ctk.CTkFrame(day, fg_color="transparent")
         text.pack(side="left", padx=18, pady=16)
         self.label(text, "하루 시작 시각", 14, "bold").pack(anchor="w")
         self.label(
             text, "이 시각 전에는 아직 전날로 봐요. 오늘 일정 브리핑은 이 시각 뒤 처음 켤 때 나와요.",
-            12, color=C["sub"],
+            12, color=C["sub"], wraplength=400, justify="left",
         ).pack(anchor="w")
         self.day_start_menu = ctk.CTkOptionMenu(
             day, values=[day_start_text(h) for h in range(13)], width=120,
@@ -3800,11 +3905,11 @@ class MainWindow:
         self.day_start_menu.pack(side="right", padx=18)
 
         self.english_card = self.card(page)
-        self.english_card.pack(fill="x", pady=(12, 0))
+        self.english_card.pack(fill="x", pady=(12, 0), padx=(0, 8))
         self.render_english_card()
 
         data = self.card(page)
-        data.pack(fill="x", pady=(12, 0))
+        data.pack(fill="x", pady=(12, 0), padx=(0, 8))
         info = ctk.CTkFrame(data, fg_color="transparent")
         info.pack(side="left", fill="x", expand=True, padx=18, pady=16)
         self.label(info, "데이터 저장 위치", 14, "bold").pack(anchor="w")
@@ -3886,6 +3991,28 @@ class MainWindow:
         self.app.update_store(lambda s: s.__setitem__("day_start", hours))
         self.flash(self.settings_msg, f"하루가 {choice}에 시작돼요.")
 
+    def set_theme(self, choice):
+        name = next(k for k, v in THEME_NAMES.items() if v == choice)
+        if name == self.app.store["theme"]:
+            return
+        self.app.update_store(lambda s: s.__setitem__("theme", name))
+        self.flash(self.settings_msg, f"{choice} 테마로 바꾸는 중이에요…")
+        self.root.after(400, self.restart_app)
+
+    def restart_app(self):
+        """새 프로그램을 띄우고 이 프로그램은 끈다. 새 쪽은 이쪽이 꺼질 때까지 기다렸다가 설정 화면을 연다."""
+        exe = Path(sys.executable)
+        pythonw = exe.with_name("pythonw.exe")
+        # 새 프로그램은 처음 띄우는 창의 표시 방식을 물려받으니, 숨김으로 켜졌던 경우에도 보이도록 직접 정한다
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startup.wShowWindow = 1  # SW_SHOWNORMAL
+        subprocess.Popen(
+            [str(pythonw if pythonw.exists() else exe), str(Path(__file__).resolve()), "--restart", "--settings"],
+            cwd=BASE_DIR, creationflags=subprocess.CREATE_NO_WINDOW, startupinfo=startup,
+        )
+        self.app.on_quit()
+
     def toggle_widget_item(self, key):
         checked = bool(self.widget_checks[key].get())
         items = dict(self.app.store["widget"]["items"])
@@ -3943,7 +4070,7 @@ class MainWindow:
             "Rec.Treeview.Heading", background=C["btn"], foreground=C["sub"], relief="flat",
             borderwidth=0, font=(UI_FONT, 10, "bold"),
         )
-        style.map("Rec.Treeview", background=[("selected", C["accent_soft"])], foreground=[("selected", "#ffffff")])
+        style.map("Rec.Treeview", background=[("selected", C["accent_soft"])], foreground=[("selected", C["tree_sel_fg"])])
         style.map("Rec.Treeview.Heading", background=[("active", C["btn_hover"])])
         style.layout("Rec.Treeview", [("Rec.Treeview.treearea", {"sticky": "nswe"})])  # 테두리 없애기
 
@@ -4385,6 +4512,9 @@ class MainWindow:
             if request == "quit":
                 self.root.destroy()
                 return
+            if isinstance(request, tuple) and request[0] == "page":
+                self.show_page(request[1])
+                continue
             if isinstance(request, tuple) and request[0] == "popup":
                 self.show_popup(request[1])
                 continue
@@ -4413,16 +4543,27 @@ class MainWindow:
         self.root.after(500, self.poll)
 
     def run(self):
-        self.poll()
+        # 창 띄우기 요청은 mainloop가 시작된 뒤에 처리한다.
+        # customtkinter가 시작하면서 제목 표시줄 색을 맞추느라 창을 숨겼다 되돌리는데, 그 전에 띄우면 다시 숨겨진다
+        self.root.after(0, self.poll)
         self.root.mainloop()
 
 
-def already_running():
-    ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\TimeAlarm_PatternApp")
-    return ctypes.windll.kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+def already_running(wait=0.0):
+    """이미 켜져 있으면 True. wait초 동안은 앞 프로그램이 꺼지기를 기다린다 (테마를 바꿔 다시 켤 때)."""
+    kernel32 = ctypes.windll.kernel32
+    deadline = time.monotonic() + wait
+    while True:
+        handle = kernel32.CreateMutexW(None, False, "Local\\TimeAlarm_PatternApp")
+        if kernel32.GetLastError() != 183:  # ERROR_ALREADY_EXISTS
+            return False  # 핸들은 프로그램이 끝날 때까지 쥐고 있는다
+        kernel32.CloseHandle(handle)
+        if time.monotonic() >= deadline:
+            return True
+        time.sleep(0.2)
 
 
 if __name__ == "__main__":
-    if already_running():
+    if already_running(wait=15 if "--restart" in sys.argv else 0):
         sys.exit(0)
     TimeAlarm().run()
