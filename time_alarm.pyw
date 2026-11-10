@@ -25,7 +25,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "눈치백단타이머"
 APP_NAME_EN = "Nunchi 100"
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.10.0"
 
 BASE_DIR = Path(__file__).resolve().parent
 STORE_PATH = BASE_DIR / "alarms.json"
@@ -101,9 +101,11 @@ ALERT_MODES = {"voice": "음성", "popup": "팝업", "both": "둘 다"}
 SNOOZE_MIN = 5
 
 # 수다백단(Suda 100, 별도 영어 회화 프로그램) 연동: 설정에서 폴더를 고르면 켜진다. 수다백단 파일은 읽기만 한다
-# path: 수다백단 폴더, time: 매일 알릴 시각, fired_on: 마지막으로 알린 날짜
-DEFAULT_ENGLISH = {"path": None, "time": "21:00", "fired_on": None}
+# path: 수다백단 폴더, time: 매일 알릴 시각, fired_on: 마지막으로 알린 날짜,
+# goals: {날짜: 하루 목표 분} 목표가 바뀐 날만 남긴다 (지난 날은 그때 목표로 판정)
+DEFAULT_ENGLISH = {"path": None, "time": "21:00", "fired_on": None, "goals": {}}
 ENGLISH_DEFAULT_GOAL = 20
+ENGLISH_MIN_MODES = 2  # 회화 완료 기준: 하루 목표 시간 이상 + 서로 다른 모드 2개 이상
 ENGLISH_TIMES = [f"{h:02d}:{m:02d}" for h in range(6, 24) for m in (0, 30)]
 DEFAULT_DAY_START = 5  # 이 시각 전에 켜면 아직 전날로 본다 (새벽 작업 중에 다음 날 브리핑이 나가지 않게)
 
@@ -209,7 +211,11 @@ def load_store():
         "briefing": data.get("briefing", True),  # PC를 켤 때 오늘 일정 브리핑
         "briefed_on": data.get("briefed_on"),  # 마지막으로 브리핑한 날짜
         "day_start": data.get("day_start", DEFAULT_DAY_START),  # 하루가 시작되는 시각 (0~12시)
-        "english": {**DEFAULT_ENGLISH, **data.get("english", {})},
+        "english": {
+            **DEFAULT_ENGLISH,
+            **data.get("english", {}),
+            "goals": dict(data.get("english", {}).get("goals", {})),
+        },
         # 작업 표시줄 위 미니 위젯: 켜짐 여부, 사용자가 옮긴 위치 [x, y] (없으면 오른쪽 아래), 보여 줄 항목
         "widget": {
             "enabled": True,
@@ -254,12 +260,66 @@ def english_dir(path):
     return folder if (folder / "main.pyw").is_file() and (folder / "talk").is_dir() else None
 
 
+def english_goal(folder):
+    """수다백단 설정의 하루 목표(분)."""
+    try:
+        return int(json.loads((folder / "settings.json").read_text(encoding="utf-8"))["daily_goal_min"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return ENGLISH_DEFAULT_GOAL
+
+
+def goal_on(goals, day, current):
+    """그날 적용할 목표: 그날이나 그 전에 기록한 가장 최근 목표. 기록보다 앞선 날은 첫 기록을 쓴다."""
+    if not goals:
+        return current
+    key = day.isoformat()
+    earlier = [d for d in goals if d <= key]
+    return goals[max(earlier)] if earlier else goals[min(goals)]
+
+
+_english_cache = {}
+
+
+def english_records(folder):
+    """{날짜: (대화한 초, 쓴 모드 집합)}. 수다백단 하루 기록 파일을 읽는다 (파일이 바뀌었을 때만 다시 읽는다)."""
+    daily = folder / "data" / "daily"
+    try:
+        stamp = tuple(sorted((e.name, e.stat().st_mtime) for e in os.scandir(daily) if e.name.endswith(".json")))
+    except OSError:
+        return {}
+    cached = _english_cache.get(daily)
+    if cached and cached[0] == stamp:
+        return cached[1]
+    records = {}
+    for name, _ in stamp:
+        try:
+            data = json.loads((daily / name).read_text(encoding="utf-8"))
+            day = datetime.date.fromisoformat(name[:-5])
+            modes = {x.get("mode") for x in data.get("sessions", []) if x.get("mode")}
+            records[day] = (int(data.get("seconds", 0)), modes)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    _english_cache[daily] = (stamp, records)
+    return records
+
+
+def english_mark(records, day, today, goal):
+    """달력 칸에 붙일 회화 표시 (글자, 종류). 종류: done / miss / none / today. 표시 안 하면 None."""
+    if not records or day < min(records) or day > today:
+        return None
+    seconds, modes = records.get(day, (0, set()))
+    if seconds >= goal * 60 and len(modes) >= ENGLISH_MIN_MODES:
+        return "✓", "done"
+    if day == today:
+        return f"{seconds // 60}분", "today"
+    if day not in records:
+        return "–", "none"
+    return "✗", "miss"
+
+
 def english_progress(folder, day):
     """(오늘 영어 대화한 분, 하루 목표 분). 수다백단 설정 파일에서는 목표만 읽는다."""
-    try:
-        goal = int(json.loads((folder / "settings.json").read_text(encoding="utf-8"))["daily_goal_min"])
-    except (OSError, ValueError, TypeError, KeyError):
-        goal = ENGLISH_DEFAULT_GOAL
+    goal = english_goal(folder)
     try:
         daily = json.loads((folder / "data" / "daily" / f"{day.isoformat()}.json").read_text(encoding="utf-8"))
         seconds = int(daily["seconds"])
@@ -1318,6 +1378,7 @@ class TimeAlarm:
                 last_beat = time.monotonic()
                 self.heartbeat()
                 self.save_cycle_state()
+                self.record_english_goal()
             self.refresh_icon()  # 남은 분이 바뀌면 트레이 숫자를 갱신 (안 바뀌면 아무것도 안 함)
 
             if time.monotonic() - last_game_check >= GAME_CHECK_SEC:
@@ -1507,6 +1568,19 @@ class TimeAlarm:
     def english_folder(self):
         with self.lock:
             return english_dir(self.store["english"]["path"])
+
+    def record_english_goal(self):
+        """수다백단 하루 목표가 바뀌었으면 오늘 날짜로 남긴다. 지난 날 판정이 새 목표로 뒤집히지 않게."""
+        folder = self.english_folder()
+        if folder is None:
+            return
+        goal = english_goal(folder)
+        with self.lock:
+            goals = self.store["english"]["goals"]
+            last = goals[max(goals)] if goals else None
+        if goal != last:
+            today = datetime.date.today().isoformat()
+            self.update_store(lambda s: s["english"]["goals"].__setitem__(today, goal))
 
     def check_english(self):
         """정한 시각에 영어 회화를 권한다. 게임 중·일시정지·잠금이면 끝날 때까지 기다렸다가 알린다."""
@@ -1814,7 +1888,15 @@ class MainWindow:
         side.grid(row=0, column=0, sticky="ns")
         side.pack_propagate(False)
         self.label(side, APP_NAME, 16, "bold").pack(anchor="w", padx=20, pady=(20, 0))
-        self.label(side, APP_NAME_EN, 11, "bold", C["mode"], mono=True).pack(anchor="w", padx=20, pady=(0, 14))
+        sub = ctk.CTkFrame(side, fg_color="transparent")
+        sub.pack(fill="x", padx=(20, 10), pady=(0, 14))
+        self.label(sub, APP_NAME_EN, 11, "bold", C["mode"], mono=True).pack(side="left")
+        self.side_english = ctk.CTkButton(
+            sub, text="수다백단 ▶", width=72, height=22, corner_radius=11, font=self.font(11, "bold"),
+            fg_color=C["accent_soft"], hover_color=C["line_hl"], text_color=C["mode"],
+            command=self.app.on_english,
+        )
+        self.update_side_english()
 
         self.nav = {}
         for key, text, glyph in NAV:
@@ -1846,6 +1928,13 @@ class MainWindow:
         self.side_clock.pack(anchor="w")
         self.side_next = self.label(status, "", 12, color=C["sub"], justify="left", anchor="w", wraplength=150)
         self.side_next.pack(anchor="w", fill="x", pady=(12, 0))
+
+    def update_side_english(self):
+        """수다백단과 연결돼 있을 때만 사이드바의 [수다백단 ▶]를 보인다."""
+        if self.app.english_folder():
+            self.side_english.pack(side="right")
+        else:
+            self.side_english.pack_forget()
 
     def show_page(self, key):
         for name, page in self.pages.items():
@@ -2492,6 +2581,9 @@ class MainWindow:
         # 여러 날 일정 막대가 칸을 가로질러야 해서 달력은 캔버스 하나에 직접 그린다
         self.cal_canvas = tk.Canvas(page, bg=C["bg"], highlightthickness=0, bd=0, cursor="hand2")
         self.cal_canvas.pack(fill="both", expand=True)
+        self.cal_english_note = self.label(page, "", 11, color=C["sub"], anchor="w")
+        self.cal_english_note.pack(fill="x", pady=(4, 0))
+        self.cal_english_stamp = None
         self.cal_canvas.bind("<Configure>", lambda _e: self.render_calendar())
         self.cal_canvas.bind("<Button-1>", self.on_calendar_click)
         self.cal_dates = []
@@ -2523,6 +2615,20 @@ class MainWindow:
         today = datetime.date.today()
         with self.app.lock:
             events = [dict(e) for e in self.app.store["events"]]
+        folder = self.app.english_folder()
+        records = english_records(folder) if folder else {}
+        self.cal_english_stamp = (folder, records)
+        if folder:
+            current_goal = english_goal(folder)
+            with self.app.lock:
+                goals = dict(self.app.store["english"]["goals"])
+            self.cal_english_note.configure(
+                text=f"영어 회화  ✓ 완료  ✗ 미완료  – 안 함  · 오늘은 지금까지 한 분 수    "
+                     f"기준: {current_goal}분 이상 + 모드 {ENGLISH_MIN_MODES}개 이상"
+            )
+        else:
+            self.cal_english_note.configure(text="")
+        mark_colors = {"done": C["good"], "miss": C["warn"], "none": C["dim"], "today": C["mode"]}
 
         f_head = tkfont.Font(family=UI_FONT, size=-int(12 * s), weight="bold")
         f_num = tkfont.Font(family=UI_FONT, size=-int(13 * s), weight="bold")
@@ -2559,11 +2665,21 @@ class MainWindow:
                     color = C["dim"]
                 number = f"{day.day}" + (" 오늘" if is_today else "")
                 canvas.create_text(x0 + 9 * s, y0 + 7 * s, text=number, anchor="nw", fill=color, font=f_num)
+                # 영어 회화 표시: 칸 오른쪽 위
+                mark = english_mark(records, day, today, goal_on(goals, day, current_goal)) if folder else None
+                mark_w = 0
+                if mark:
+                    mark_color = mark_colors[mark[1]] if in_month else C["dim"]
+                    canvas.create_text(
+                        x0 + col_w - 9 * s, y0 + 7 * s, text=mark[0], anchor="ne", fill=mark_color,
+                        font=f_num if mark[1] != "today" else f_holiday,
+                    )
+                    mark_w = f_num.measure(mark[0]) + 6 * s
                 if holiday:
                     hx = x0 + 9 * s + f_num.measure(number) + 5 * s
                     canvas.create_text(
                         hx, y0 + 9 * s, anchor="nw", font=f_holiday,
-                        text=fit_text(f_holiday, holiday.replace(" 대체 휴일", " 대체"), x0 + col_w - hx - 6 * s),
+                        text=fit_text(f_holiday, holiday.replace(" 대체 휴일", " 대체"), x0 + col_w - hx - 6 * s - mark_w),
                         fill=C["warn"] if in_month else C["dim"],
                     )
                 canvas.create_text(
@@ -3688,6 +3804,7 @@ class MainWindow:
 
     def english_changed(self, message):
         self.render_english_card()
+        self.update_side_english()
         self.update_english_rows()
         self.app.icon.update_menu()
         self.flash(self.settings_msg, message)
@@ -4220,6 +4337,11 @@ class MainWindow:
             self.records_seen = self.app.records_version
             self.render_records()
         self.check_retention()
+        if time.monotonic() - getattr(self, "english_checked", 0) >= 30:
+            self.english_checked = time.monotonic()
+            folder = self.app.english_folder()
+            if self.cal_english_stamp is not None and (folder, english_records(folder) if folder else {}) != self.cal_english_stamp:
+                self.render_calendar()
         if getattr(self, "cal_today", None) != datetime.date.today():
             self.cal_today = datetime.date.today()  # 자정이 지나면 '오늘' 표시를 옮긴다
             self.render_calendar()
