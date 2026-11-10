@@ -25,7 +25,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "눈치백단타이머"
 APP_NAME_EN = "Nunchi 100"
-APP_VERSION = "1.11.1"
+APP_VERSION = "1.11.2"
+TASKBAR_ID = "Nunchi100.TimeAlarm"  # 작업 표시줄 이름표 (set_taskbar_id)
 
 BASE_DIR = Path(__file__).resolve().parent
 STORE_PATH = BASE_DIR / "alarms.json"
@@ -4568,7 +4569,18 @@ def already_running():
     return ctypes.windll.kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
 
 
+def set_taskbar_id():
+    """작업 표시줄에서 이 앱을 구분하는 이름표를 붙인다. 창을 만들기 전에 불러야 한다.
+    없으면 Windows가 같은 pythonw.exe로 켜진 다른 앱(예: 수다백단)과 한 버튼으로 묶고,
+    작업 표시줄에 고정한 그 앱의 아이콘 아래에 이 창을 넣어 버린다."""
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(TASKBAR_ID)
+    except (AttributeError, OSError):
+        pass
+
+
 if __name__ == "__main__":
     if already_running():
         sys.exit(0)
+    set_taskbar_id()
     TimeAlarm().run()
