@@ -25,7 +25,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "눈치백단타이머"
 APP_NAME_EN = "Nunchi 100"
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.10.1"
 
 BASE_DIR = Path(__file__).resolve().parent
 STORE_PATH = BASE_DIR / "alarms.json"
@@ -106,6 +106,9 @@ SNOOZE_MIN = 5
 DEFAULT_ENGLISH = {"path": None, "time": "21:00", "fired_on": None, "goals": {}}
 ENGLISH_DEFAULT_GOAL = 20
 ENGLISH_MIN_MODES = 2  # 회화 완료 기준: 하루 목표 시간 이상 + 서로 다른 모드 2개 이상
+# 달력 칸의 회화 배지 색: 완료 초록, 미완료 빨강, 오늘 진행 중 노랑, 안 함 회색
+ENGLISH_COLORS = {"done": "#40C057", "miss": "#FA5252", "today": "#FCC419", "none": "#5C6380"}
+ENGLISH_LEGEND = [("done", "완료"), ("miss", "미완료"), ("today", "오늘 진행 중"), ("none", "안 함")]
 ENGLISH_TIMES = [f"{h:02d}:{m:02d}" for h in range(6, 24) for m in (0, 30)]
 DEFAULT_DAY_START = 5  # 이 시각 전에 켜면 아직 전날로 본다 (새벽 작업 중에 다음 날 브리핑이 나가지 않게)
 
@@ -304,17 +307,67 @@ def english_records(folder):
 
 
 def english_mark(records, day, today, goal):
-    """달력 칸에 붙일 회화 표시 (글자, 종류). 종류: done / miss / none / today. 표시 안 하면 None."""
+    """달력 칸에 붙일 회화 표시 (종류, 옆에 쓸 글자). 종류: done / miss / none / today. 표시 안 하면 None."""
     if not records or day < min(records) or day > today:
         return None
     seconds, modes = records.get(day, (0, set()))
     if seconds >= goal * 60 and len(modes) >= ENGLISH_MIN_MODES:
-        return "✓", "done"
+        return "done", ""
     if day == today:
-        return f"{seconds // 60}분", "today"
+        return "today", f"{seconds // 60}분"
     if day not in records:
-        return "–", "none"
-    return "✗", "miss"
+        return "none", ""
+    return "miss", ""
+
+
+def draw_english_badge(canvas, cx, cy, r, kind, color):
+    """회화 배지를 도형으로 그린다 (기호 글꼴은 작은 크기에서 깨져서). r = 반지름."""
+    if kind == "none":
+        canvas.create_oval(cx - r, cy - r, cx + r, cy + r, outline=color, width=max(1.5, r / 4))
+        return
+    if kind == "today":
+        h = r * 1.9
+        canvas.create_polygon(
+            cx, cy - h * 0.55, cx + h * 0.58, cy + h * 0.45, cx - h * 0.58, cy + h * 0.45, fill=color, outline=""
+        )
+        return
+    canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=color, outline="")
+    w = max(1.5, r * 0.28)
+    if kind == "done":
+        canvas.create_line(
+            cx - r * 0.5, cy + r * 0.02, cx - r * 0.15, cy + r * 0.38, cx + r * 0.52, cy - r * 0.4,
+            fill="white", width=w, capstyle="round", joinstyle="round",
+        )
+    else:
+        k = r * 0.42
+        canvas.create_line(cx - k, cy - k, cx + k, cy + k, fill="white", width=w, capstyle="round")
+        canvas.create_line(cx - k, cy + k, cx + k, cy - k, fill="white", width=w, capstyle="round")
+
+
+def english_badge_image(kind, size=14, scale=4):
+    """달력 아래 설명 줄에 쓸 배지 그림 (달력 칸과 같은 모양)."""
+    n = size * scale
+    img = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    c, r, color = n / 2, n * 0.45, ENGLISH_COLORS[kind]
+    if kind == "none":
+        d.ellipse((c - r, c - r, c + r, c + r), outline=color, width=int(r / 4))
+    elif kind == "today":
+        h = r * 1.9
+        d.polygon([(c, c - h * 0.55), (c + h * 0.58, c + h * 0.45), (c - h * 0.58, c + h * 0.45)], fill=color)
+    else:
+        d.ellipse((c - r, c - r, c + r, c + r), fill=color)
+        w = int(r * 0.28)
+        if kind == "done":
+            pts = [(c - r * 0.5, c + r * 0.02), (c - r * 0.15, c + r * 0.38), (c + r * 0.52, c - r * 0.4)]
+            d.line(pts, fill="white", width=w, joint="curve")
+            for x, y in (pts[0], pts[2]):
+                d.ellipse((x - w / 2, y - w / 2, x + w / 2, y + w / 2), fill="white")
+        else:
+            k = r * 0.42
+            d.line((c - k, c - k, c + k, c + k), fill="white", width=w)
+            d.line((c - k, c + k, c + k, c - k), fill="white", width=w)
+    return img
 
 
 def english_progress(folder, day):
@@ -2581,8 +2634,15 @@ class MainWindow:
         # 여러 날 일정 막대가 칸을 가로질러야 해서 달력은 캔버스 하나에 직접 그린다
         self.cal_canvas = tk.Canvas(page, bg=C["bg"], highlightthickness=0, bd=0, cursor="hand2")
         self.cal_canvas.pack(fill="both", expand=True)
-        self.cal_english_note = self.label(page, "", 11, color=C["sub"], anchor="w")
-        self.cal_english_note.pack(fill="x", pady=(4, 0))
+        self.cal_english_legend = ctk.CTkFrame(page, fg_color="transparent")
+        self.label(self.cal_english_legend, "영어 회화", 11, "bold", C["sub"]).pack(side="left", padx=(2, 10))
+        for kind, name in ENGLISH_LEGEND:
+            icon = ctk.CTkImage(english_badge_image(kind), size=(14, 14))
+            self.label(self.cal_english_legend, " " + name, 11, color=C["sub"], image=icon, compound="left").pack(
+                side="left", padx=(0, 12)
+            )
+        self.cal_english_note = self.label(self.cal_english_legend, "", 11, color=C["dim"])
+        self.cal_english_note.pack(side="right")
         self.cal_english_stamp = None
         self.cal_canvas.bind("<Configure>", lambda _e: self.render_calendar())
         self.cal_canvas.bind("<Button-1>", self.on_calendar_click)
@@ -2622,13 +2682,10 @@ class MainWindow:
             current_goal = english_goal(folder)
             with self.app.lock:
                 goals = dict(self.app.store["english"]["goals"])
-            self.cal_english_note.configure(
-                text=f"영어 회화  ✓ 완료  ✗ 미완료  – 안 함  · 오늘은 지금까지 한 분 수    "
-                     f"기준: {current_goal}분 이상 + 모드 {ENGLISH_MIN_MODES}개 이상"
-            )
+            self.cal_english_note.configure(text=f"기준: {current_goal}분 이상 + 모드 {ENGLISH_MIN_MODES}개 이상")
+            self.cal_english_legend.pack(fill="x", pady=(6, 0))
         else:
-            self.cal_english_note.configure(text="")
-        mark_colors = {"done": C["good"], "miss": C["warn"], "none": C["dim"], "today": C["mode"]}
+            self.cal_english_legend.pack_forget()
 
         f_head = tkfont.Font(family=UI_FONT, size=-int(12 * s), weight="bold")
         f_num = tkfont.Font(family=UI_FONT, size=-int(13 * s), weight="bold")
@@ -2669,12 +2726,18 @@ class MainWindow:
                 mark = english_mark(records, day, today, goal_on(goals, day, current_goal)) if folder else None
                 mark_w = 0
                 if mark:
-                    mark_color = mark_colors[mark[1]] if in_month else C["dim"]
-                    canvas.create_text(
-                        x0 + col_w - 9 * s, y0 + 7 * s, text=mark[0], anchor="ne", fill=mark_color,
-                        font=f_num if mark[1] != "today" else f_holiday,
-                    )
-                    mark_w = f_num.measure(mark[0]) + 6 * s
+                    kind, note = mark
+                    # 다른 달 칸은 흐리게
+                    mark_color = ENGLISH_COLORS[kind] if in_month else mix(ENGLISH_COLORS[kind], C["bg"], 0.4)
+                    r = 7 * s
+                    bx, by = x0 + col_w - 9 * s - r, y0 + 7 * s + r
+                    draw_english_badge(canvas, bx, by, r, kind, mark_color)
+                    mark_w = 2 * r + 4 * s
+                    if note:
+                        canvas.create_text(
+                            bx - r - 4 * s, by, text=note, anchor="e", fill=mark_color, font=f_holiday,
+                        )
+                        mark_w += f_holiday.measure(note) + 4 * s
                 if holiday:
                     hx = x0 + 9 * s + f_num.measure(number) + 5 * s
                     canvas.create_text(
