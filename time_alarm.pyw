@@ -25,8 +25,10 @@ from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "눈치백단타이머"
 APP_NAME_EN = "Nunchi 100"
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.12.1"
 TASKBAR_ID = "Nunchi100.TimeAlarm"  # 작업 표시줄 이름표 (set_taskbar_id)
+SHOW_EVENT = "Local\\Nunchi100_Show"  # 이미 켜져 있을 때 바로가기를 누르면 이 신호로 창을 띄운다
+TRAY_ARG = "--tray"  # PC를 켤 때 자동 실행: 창 없이 트레이에서만 시작
 
 BASE_DIR = Path(__file__).resolve().parent
 STORE_PATH = BASE_DIR / "alarms.json"
@@ -758,7 +760,16 @@ def set_autostart(enabled):
     if not enabled:
         STARTUP_LINK.unlink(missing_ok=True)
         return not STARTUP_LINK.exists()
-    return make_shortcut(STARTUP_LINK)
+    return make_shortcut(STARTUP_LINK, tray=True)
+
+
+def fix_startup_link():
+    """예전에 만든 시작 프로그램 바로가기에는 --tray가 없어서 PC를 켤 때 창이 뜬다. 있으면 고쳐 둔다."""
+    try:
+        if STARTUP_LINK.exists() and TRAY_ARG.encode("utf-16-le") not in STARTUP_LINK.read_bytes():
+            threading.Thread(target=make_shortcut, args=(STARTUP_LINK, True), daemon=True).start()
+    except OSError:
+        pass
 
 
 def desktop_dir():
@@ -773,13 +784,14 @@ def desktop_link():
     return desktop_dir() / f"{APP_NAME}.lnk"
 
 
-def make_shortcut(link):
-    """이 앱을 콘솔 창 없이 켜는 바로가기를 만든다 (전용 아이콘 + 작업 표시줄 ID). 성공하면 True."""
+def make_shortcut(link, tray=False):
+    """이 앱을 콘솔 창 없이 켜는 바로가기를 만든다 (전용 아이콘 + 작업 표시줄 ID). 성공하면 True.
+    tray면 창 없이 트레이에서만 시작한다 (시작 프로그램용)."""
     pythonw = Path(sys.executable).with_name("pythonw.exe")  # 콘솔 창 없이 실행
     script = (
         "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:TA_LINK);"
         "$s.TargetPath = $env:TA_TARGET;"
-        "$s.Arguments = '\"' + $env:TA_SCRIPT + '\"';"
+        "$s.Arguments = '\"' + $env:TA_SCRIPT + '\"' + $env:TA_ARGS;"
         "$s.WorkingDirectory = $env:TA_DIR;"
         "$s.Description = $env:TA_DESC;"
         "if ($env:TA_ICON) { $s.IconLocation = $env:TA_ICON + ',0' };"
@@ -790,6 +802,7 @@ def make_shortcut(link):
         TA_LINK=str(link),
         TA_TARGET=str(pythonw if pythonw.exists() else sys.executable),
         TA_SCRIPT=str(Path(__file__).resolve()),
+        TA_ARGS=f" {TRAY_ARG}" if tray else "",
         TA_DIR=str(BASE_DIR),
         TA_DESC=f"{APP_NAME} ({APP_NAME_EN})",
         TA_ICON=str(ICON_PATH) if ICON_PATH.exists() else "",
@@ -1286,6 +1299,7 @@ class TimeAlarm:
         self.brief_pending = True  # 켜진 직후, 절전에서 깬 뒤, 잠금을 푼 뒤에 오늘 브리핑을 확인한다
         self.first_run = not STORE_PATH.exists()  # 처음 실행이면 창을 바로 띄워 준다
         migrate_old_startup_link()
+        fix_startup_link()
         self.store = load_store()
         apply_theme(self.store["theme"])
         self.store_version = 0
@@ -1909,11 +1923,24 @@ class TimeAlarm:
     def on_quit(self, *_):
         self.ui_requests.put("quit")
 
+    def listen_show(self):
+        """이미 켜져 있는데 바로가기를 또 누르면, 새로 켜지려던 쪽이 신호를 보낸다. 그러면 창을 띄운다."""
+        kernel32 = ctypes.windll.kernel32
+        event = kernel32.CreateEventW(None, False, False, SHOW_EVENT)  # 자동으로 다시 꺼지는 신호
+        if not event:
+            return
+        while not self.stop_event.is_set():
+            if kernel32.WaitForSingleObject(event, 1000) == 0:  # WAIT_OBJECT_0
+                self.ui_requests.put("show")
+        kernel32.CloseHandle(event)
+
     def run(self):
         threading.Thread(target=self.run_loop, daemon=True).start()
         self.icon.run_detached()
-        if self.first_run:
+        # 바로가기·run.bat으로 직접 켜면 창을 띄운다. PC를 켤 때 자동 실행(--tray)이면 트레이에만 있는다
+        if self.first_run or TRAY_ARG not in sys.argv:
             self.ui_requests.put("show")
+        threading.Thread(target=self.listen_show, daemon=True).start()
         try:
             MainWindow(self).run()
         finally:
@@ -4682,8 +4709,19 @@ def set_taskbar_id():
         pass
 
 
+def show_running_instance():
+    """이미 켜져 있는 눈치백단에게 창을 띄우라고 알린다."""
+    ctypes.windll.user32.AllowSetForegroundWindow(-1)  # 그쪽 창이 맨 앞으로 올 수 있게 (ASFW_ANY)
+    event = ctypes.windll.kernel32.OpenEventW(0x0002, False, SHOW_EVENT)  # EVENT_MODIFY_STATE
+    if event:
+        ctypes.windll.kernel32.SetEvent(event)
+        ctypes.windll.kernel32.CloseHandle(event)
+
+
 if __name__ == "__main__":
     if already_running():
+        if TRAY_ARG not in sys.argv:
+            show_running_instance()
         sys.exit(0)
     set_taskbar_id()
     TimeAlarm().run()
