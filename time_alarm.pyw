@@ -25,7 +25,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "눈치백단타이머"
 APP_NAME_EN = "Nunchi 100"
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.11.1"
 
 BASE_DIR = Path(__file__).resolve().parent
 STORE_PATH = BASE_DIR / "alarms.json"
@@ -1833,10 +1833,8 @@ class TimeAlarm:
     def run(self):
         threading.Thread(target=self.run_loop, daemon=True).start()
         self.icon.run_detached()
-        if self.first_run or "--settings" in sys.argv:
+        if self.first_run:
             self.ui_requests.put("show")
-        if "--settings" in sys.argv:
-            self.ui_requests.put(("page", "settings"))  # 테마를 바꾸고 다시 켜졌을 때
         try:
             MainWindow(self).run()
         finally:
@@ -1881,6 +1879,11 @@ class MainWindow:
 
         self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_rowconfigure(1, weight=1)
+        self.current_page = "main"
+        self.build_ui()
+
+    def build_ui(self):
+        """창 안의 모든 화면과 미니 위젯을 지금 테마(C) 색으로 만든다."""
         self.build_gamebar()
         shell = ctk.CTkFrame(self.root, fg_color=C["bg"], corner_radius=0)
         shell.grid(row=1, column=0, sticky="nsew")
@@ -1900,7 +1903,7 @@ class MainWindow:
             "records": self.build_records_page(content),
             "settings": self.build_settings_page(content),
         }
-        self.show_page("main")
+        self.show_page(self.current_page)
         self.clear_form()
         self.build_widget()
 
@@ -2071,6 +2074,7 @@ class MainWindow:
             self.side_english.pack_forget()
 
     def show_page(self, key):
+        self.current_page = key
         for name, page in self.pages.items():
             if name != key:
                 page.pack_forget()
@@ -3829,7 +3833,7 @@ class MainWindow:
         text.pack(side="left", padx=18, pady=16)
         self.label(text, "화면 테마", 14, "bold").pack(anchor="w")
         self.label(
-            text, "바꾸면 프로그램이 잠깐 다시 켜지면서 바로 적용돼요. 메인 알람은 그대로 이어져요.",
+            text, "누르면 바로 바뀌어요. 알람·타이머·스탑워치는 끊기지 않아요.",
             12, color=C["sub"], wraplength=400, justify="left",
         ).pack(anchor="w")
         self.theme_buttons = ctk.CTkSegmentedButton(
@@ -3996,22 +4000,35 @@ class MainWindow:
         if name == self.app.store["theme"]:
             return
         self.app.update_store(lambda s: s.__setitem__("theme", name))
-        self.flash(self.settings_msg, f"{choice} 테마로 바꾸는 중이에요…")
-        self.root.after(400, self.restart_app)
+        self.root.after(50, lambda: self.rebuild_theme(name, choice))  # 버튼 눌림 처리가 끝난 뒤에
 
-    def restart_app(self):
-        """새 프로그램을 띄우고 이 프로그램은 끈다. 새 쪽은 이쪽이 꺼질 때까지 기다렸다가 설정 화면을 연다."""
-        exe = Path(sys.executable)
-        pythonw = exe.with_name("pythonw.exe")
-        # 새 프로그램은 처음 띄우는 창의 표시 방식을 물려받으니, 숨김으로 켜졌던 경우에도 보이도록 직접 정한다
-        startup = subprocess.STARTUPINFO()
-        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startup.wShowWindow = 1  # SW_SHOWNORMAL
-        subprocess.Popen(
-            [str(pythonw if pythonw.exists() else exe), str(Path(__file__).resolve()), "--restart", "--settings"],
-            cwd=BASE_DIR, creationflags=subprocess.CREATE_NO_WINDOW, startupinfo=startup,
-        )
-        self.app.on_quit()
+    def rebuild_theme(self, name, choice):
+        """프로그램을 다시 켜지 않고, 같은 창에서 모든 화면을 새 테마 색으로 다시 만든다.
+        메인 알람·타이머는 원래 화면 밖에서 돌고, 스탑워치·보던 화면·달력 달은 그대로 옮겨 온다."""
+        stopwatch = (self.sw_started, self.sw_total, list(self.sw_laps))
+        for job in [self.sw_job, self.voice_job, *self.flash_jobs.values()]:
+            if job:
+                self.root.after_cancel(job)
+        self.flash_jobs = {}
+        self.voice_job = None
+        # 먼저 지운다. 테마부터 바꾸면 곧 지울 화면까지 새 색으로 한 번 더 그려서 느려진다
+        for child in self.root.winfo_children():  # 화면, 미니 위젯, 팝업, 일정 창 모두
+            child.destroy()
+        apply_theme(name)
+        ctk.set_appearance_mode(C["appearance"])  # 제목 표시줄·스크롤바 색
+        self.root.configure(fg_color=C["bg"])
+        self.popups, self.day_dialog, self.event_editing, self.editing_id = [], None, None, None
+        self.ring_key, self.records_seen = None, -1
+        self.build_ui()
+        self.sw_started, self.sw_total, self.sw_laps = stopwatch
+        self.render_laps()
+        self.sw_update_buttons()
+        if self.sw_started is not None:
+            self.sw_tick()
+        else:
+            self.sw_label.configure(text=fmt_clock(self.sw_total, True))
+        self.update_status()
+        self.flash(self.settings_msg, f"{choice} 테마로 바꿨어요.")
 
     def toggle_widget_item(self, key):
         checked = bool(self.widget_checks[key].get())
@@ -4512,9 +4529,6 @@ class MainWindow:
             if request == "quit":
                 self.root.destroy()
                 return
-            if isinstance(request, tuple) and request[0] == "page":
-                self.show_page(request[1])
-                continue
             if isinstance(request, tuple) and request[0] == "popup":
                 self.show_popup(request[1])
                 continue
@@ -4549,21 +4563,12 @@ class MainWindow:
         self.root.mainloop()
 
 
-def already_running(wait=0.0):
-    """이미 켜져 있으면 True. wait초 동안은 앞 프로그램이 꺼지기를 기다린다 (테마를 바꿔 다시 켤 때)."""
-    kernel32 = ctypes.windll.kernel32
-    deadline = time.monotonic() + wait
-    while True:
-        handle = kernel32.CreateMutexW(None, False, "Local\\TimeAlarm_PatternApp")
-        if kernel32.GetLastError() != 183:  # ERROR_ALREADY_EXISTS
-            return False  # 핸들은 프로그램이 끝날 때까지 쥐고 있는다
-        kernel32.CloseHandle(handle)
-        if time.monotonic() >= deadline:
-            return True
-        time.sleep(0.2)
+def already_running():
+    ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\TimeAlarm_PatternApp")
+    return ctypes.windll.kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
 
 
 if __name__ == "__main__":
-    if already_running(wait=15 if "--restart" in sys.argv else 0):
+    if already_running():
         sys.exit(0)
     TimeAlarm().run()
