@@ -25,7 +25,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "눈치백단타이머"
 APP_NAME_EN = "Nunchi 100"
-APP_VERSION = "1.11.2"
+APP_VERSION = "1.12.0"
 TASKBAR_ID = "Nunchi100.TimeAlarm"  # 작업 표시줄 이름표 (set_taskbar_id)
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -38,6 +38,7 @@ OFF_TOLERANCE_SEC = 60
 STARTUP_DIR = Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs/Startup"
 STARTUP_LINK = STARTUP_DIR / f"{APP_NAME}.lnk"
 OLD_STARTUP_LINK = STARTUP_DIR / "시간 알림.lnk"  # v1.0.0 때 이름
+ICON_PATH = BASE_DIR / "assets" / "nunchi100.ico"  # 바로가기·창 아이콘 (보라 둥근 사각형 + 시계 + 100)
 RECORDS_PATH = BASE_DIR / "records.json"
 BACKUP_DIR = BASE_DIR / "기록 백업"
 
@@ -757,30 +758,107 @@ def set_autostart(enabled):
     if not enabled:
         STARTUP_LINK.unlink(missing_ok=True)
         return not STARTUP_LINK.exists()
+    return make_shortcut(STARTUP_LINK)
+
+
+def desktop_dir():
+    """바탕화면 폴더 (OneDrive로 옮겨 둔 경우도 Windows가 알려 주는 실제 위치)."""
+    buf = ctypes.create_unicode_buffer(260)
+    if ctypes.windll.shell32.SHGetFolderPathW(None, 0x0010, None, 0, buf) == 0:  # CSIDL_DESKTOPDIRECTORY
+        return Path(buf.value)
+    return Path.home() / "Desktop"
+
+
+def desktop_link():
+    return desktop_dir() / f"{APP_NAME}.lnk"
+
+
+def make_shortcut(link):
+    """이 앱을 콘솔 창 없이 켜는 바로가기를 만든다 (전용 아이콘 + 작업 표시줄 ID). 성공하면 True."""
     pythonw = Path(sys.executable).with_name("pythonw.exe")  # 콘솔 창 없이 실행
     script = (
         "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:TA_LINK);"
         "$s.TargetPath = $env:TA_TARGET;"
         "$s.Arguments = '\"' + $env:TA_SCRIPT + '\"';"
         "$s.WorkingDirectory = $env:TA_DIR;"
+        "$s.Description = $env:TA_DESC;"
+        "if ($env:TA_ICON) { $s.IconLocation = $env:TA_ICON + ',0' };"
         "$s.Save()"
     )
     env = dict(
         os.environ,
-        TA_LINK=str(STARTUP_LINK),
+        TA_LINK=str(link),
         TA_TARGET=str(pythonw if pythonw.exists() else sys.executable),
         TA_SCRIPT=str(Path(__file__).resolve()),
         TA_DIR=str(BASE_DIR),
+        TA_DESC=f"{APP_NAME} ({APP_NAME_EN})",
+        TA_ICON=str(ICON_PATH) if ICON_PATH.exists() else "",
     )
     try:
-        STARTUP_LINK.parent.mkdir(parents=True, exist_ok=True)
+        link.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
             env=env, timeout=20, creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    return STARTUP_LINK.exists()
+    if link.exists():
+        set_link_taskbar_id(link)
+    return link.exists()
+
+
+def set_link_taskbar_id(link):
+    """바로가기에 작업 표시줄 ID를 적는다. 그래야 이 바로가기를 작업 표시줄에 고정했을 때
+    켜져 있는 창과 같은 버튼으로 묶인다 (없으면 고정 아이콘과 창이 따로 뜬다)."""
+    try:
+        import comtypes
+        import comtypes.client
+        from comtypes import COMMETHOD, GUID, HRESULT, IUnknown
+
+        class PROPERTYKEY(ctypes.Structure):
+            _fields_ = [("fmtid", GUID), ("pid", ctypes.c_ulong)]
+
+        class PROPVARIANT(ctypes.Structure):
+            _fields_ = [
+                ("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort), ("r2", ctypes.c_ushort), ("r3", ctypes.c_ushort),
+                ("pwszVal", ctypes.c_wchar_p), ("pad", ctypes.c_void_p),
+            ]
+
+        class IPropertyStore(IUnknown):
+            _iid_ = GUID("{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}")
+            _methods_ = [
+                COMMETHOD([], HRESULT, "GetCount", (["out"], ctypes.POINTER(ctypes.c_ulong))),
+                COMMETHOD([], HRESULT, "GetAt", (["in"], ctypes.c_ulong), (["out"], ctypes.POINTER(PROPERTYKEY))),
+                COMMETHOD([], HRESULT, "GetValue", (["in"], ctypes.POINTER(PROPERTYKEY)),
+                          (["in"], ctypes.POINTER(PROPVARIANT))),
+                COMMETHOD([], HRESULT, "SetValue", (["in"], ctypes.POINTER(PROPERTYKEY)),
+                          (["in"], ctypes.POINTER(PROPVARIANT))),
+                COMMETHOD([], HRESULT, "Commit"),
+            ]
+
+        class IPersistFile(IUnknown):
+            _iid_ = GUID("{0000010B-0000-0000-C000-000000000046}")
+            _methods_ = [
+                COMMETHOD([], HRESULT, "GetClassID", (["out"], ctypes.POINTER(GUID))),
+                COMMETHOD([], HRESULT, "IsDirty"),
+                COMMETHOD([], HRESULT, "Load", (["in"], ctypes.c_wchar_p), (["in"], ctypes.c_ulong)),
+                COMMETHOD([], HRESULT, "Save", (["in"], ctypes.c_wchar_p), (["in"], ctypes.c_int)),
+                COMMETHOD([], HRESULT, "SaveCompleted", (["in"], ctypes.c_wchar_p)),
+                COMMETHOD([], HRESULT, "GetCurFile", (["out"], ctypes.POINTER(ctypes.c_wchar_p))),
+            ]
+
+        comtypes.CoInitialize()
+        shell_link = comtypes.client.CreateObject(GUID("{00021401-0000-0000-C000-000000000046}"), interface=IPersistFile)
+        shell_link.Load(str(link), 2)  # STGM_READWRITE
+        store = shell_link.QueryInterface(IPropertyStore)
+        key = PROPERTYKEY(GUID("{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}"), 5)  # PKEY_AppUserModel_ID
+        value = PROPVARIANT(31, 0, 0, 0, TASKBAR_ID, None)  # VT_LPWSTR
+        store.SetValue(ctypes.byref(key), ctypes.byref(value))
+        store.Commit()
+        shell_link.Save(None, 1)
+        return True
+    except Exception:  # comtypes가 없거나 COM 오류 → 아이콘만 있는 바로가기로 둔다
+        return False
 
 
 def is_locked():
@@ -2004,8 +2082,10 @@ class MainWindow:
 
     def set_window_icon(self):
         try:
-            path = Path(tempfile.gettempdir()) / "time_alarm.ico"
-            make_icon((139, 108, 255)).save(path, format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (64, 64)])
+            path = ICON_PATH  # 바로가기와 같은 아이콘 (작업 표시줄에도 이 아이콘이 뜬다)
+            if not path.exists():
+                path = Path(tempfile.gettempdir()) / "time_alarm.ico"
+                make_icon((139, 108, 255)).save(path, format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (64, 64)])
             # customtkinter가 시작할 때 자기 아이콘을 덮어쓰므로 조금 뒤에 바꾼다
             self.root.after(300, lambda: self.root.iconbitmap(str(path)))
         except (OSError, tk.TclError):
@@ -3859,6 +3939,19 @@ class MainWindow:
         if autostart_enabled():
             self.autostart_switch.select()
 
+        shortcut = self.card(page)
+        shortcut.pack(fill="x", pady=(12, 0), padx=(0, 8))
+        text = ctk.CTkFrame(shortcut, fg_color="transparent")
+        text.pack(side="left", padx=18, pady=16)
+        self.label(text, "바탕화면 바로가기", 14, "bold").pack(anchor="w")
+        self.label(
+            text, "전용 아이콘으로 만들어요. 작업 표시줄에 고정해도 수다백단과 섞이지 않아요.", 12, color=C["sub"],
+            wraplength=400, justify="left",
+        ).pack(anchor="w")
+        self.shortcut_btn = self.button(shortcut, "", self.create_desktop_link, width=96)
+        self.shortcut_btn.pack(side="right", padx=18)
+        self.update_shortcut_btn()
+
         mini = self.card(page)
         mini.pack(fill="x", pady=(12, 0), padx=(0, 8))
         top = ctk.CTkFrame(mini, fg_color="transparent")
@@ -4042,6 +4135,16 @@ class MainWindow:
             return
         self.app.update_store(lambda s: s["widget"].__setitem__("items", items))
         self.apply_widget_layout()
+
+    def update_shortcut_btn(self):
+        self.shortcut_btn.configure(text="다시 만들기" if desktop_link().exists() else "만들기")
+
+    def create_desktop_link(self):
+        if make_shortcut(desktop_link()):
+            self.flash(self.settings_msg, "바탕화면에 바로가기를 만들었어요.")
+        else:
+            self.flash(self.settings_msg, "바로가기를 만들지 못했어요. 다시 시도해 주세요.", C["warn"])
+        self.update_shortcut_btn()
 
     def toggle_autostart(self):
         enabled = bool(self.autostart_switch.get())
